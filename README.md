@@ -1,16 +1,35 @@
-# NexusLink
+# NexusLink（畅连）
 
-### A GUI client for Windows, Linux and macOS. Support [Xray](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box) and [others](https://github.com/2dust/NexusLink/wiki/List-of-supported-cores)
+> **来源声明**：本仓库是 [v2rayN](https://github.com/2dust/v2rayN) **7.25.6**（作者 [2dust](https://github.com/2dust)，许可证 [GPL-3.0](LICENSE)）的修改版，应用更名为 NexusLink / 畅连，仅供本机自用，未公开发布。
+>
+> 修改内容：应用更名与界面重做、内置「节点管家」（`NexusLink/ServiceLib/Services/KeeperService.cs`）、移除 Avalonia 桌面版、AmazTool 以及 Linux / macOS 打包脚本。
+>
+> 下文的徽章、下载、Wiki、GPG 指纹均属**上游**，链接已指回 2dust/v2rayN。
+> 上游源码：https://github.com/2dust/v2rayN （tag 7.25.6）
 
-[![CodeFactor](https://www.codefactor.io/repository/github/2dust/nexuslink/badge)](https://www.codefactor.io/repository/github/2dust/nexuslink)
-[![Release](https://img.shields.io/github/v/release/2dust/NexusLink?logo=github&label=Release)](https://github.com/2dust/NexusLink/releases)
-[![Downloads](https://img.shields.io/github/downloads/2dust/NexusLink/latest/total?logo=github&label=Downloads)](https://github.com/2dust/NexusLink/releases)
-[![Telegram](https://img.shields.io/badge/Telegram-Chat-26A5E4?logo=telegram)](https://t.me/nexuslink)
+---
+
+## 本地构建（Windows x64，单文件）
+
+```powershell
+dotnet publish NexusLink\NexusLink\NexusLink.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish-win
+```
+
+解决方案只保留 4 个可构建项目：`NexusLink`（WPF 界面）、`ServiceLib`、`ServiceLib.UdpTest`（测速功能的依赖）、`ServiceLib.Tests`。
+
+使用说明与节点来源说明见 [README-畅连.md](README-畅连.md)。
+
+---
+### A GUI client for Windows, Linux and macOS. Support [Xray](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box) and [others](https://github.com/2dust/v2rayN/wiki/List-of-supported-cores)
+
+[![CodeFactor](https://www.codefactor.io/repository/github/2dust/v2rayN/badge)](https://www.codefactor.io/repository/github/2dust/v2rayN)
+[![Release](https://img.shields.io/github/v/release/2dust/v2rayN?logo=github&label=Release)](https://github.com/2dust/v2rayN/releases)
+[![Downloads](https://img.shields.io/github/downloads/2dust/v2rayN/latest/total?logo=github&label=Downloads)](https://github.com/2dust/v2rayN/releases)
  
-[![Windows](https://img.shields.io/badge/Windows-supported-0078D6?logo=windows)](https://github.com/2dust/NexusLink) 
-[![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=000)](https://github.com/2dust/NexusLink) 
-[![macOS](https://img.shields.io/badge/macOS-supported-000000?logo=apple)](https://github.com/2dust/NexusLink) 
-[![GPG Signed](https://img.shields.io/badge/GPG-signed-4B32C3?logo=gnuprivacyguard)](https://github.com/2dust/NexusLink)
+[![Windows](https://img.shields.io/badge/Windows-supported-0078D6?logo=windows)](https://github.com/2dust/v2rayN) 
+[![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=000)](https://github.com/2dust/v2rayN) 
+[![macOS](https://img.shields.io/badge/macOS-supported-000000?logo=apple)](https://github.com/2dust/v2rayN) 
+[![GPG Signed](https://img.shields.io/badge/GPG-signed-4B32C3?logo=gnuprivacyguard)](https://github.com/2dust/v2rayN)
 
 
 ---
@@ -21,14 +40,14 @@ Download the latest release here:
 
 在这里下载最新版本：
 
-[https://github.com/2dust/NexusLink/releases](https://github.com/2dust/NexusLink/releases)
+[https://github.com/2dust/v2rayN/releases](https://github.com/2dust/v2rayN/releases)
 
 
 > [!TIP]
-> NexusLink is the desktop version. For the mobile version, please visit the NexusLinkG \
-> NexusLink 是电脑版，手机版请访问 NexusLinkG
+> NexusLink is the desktop version. For the mobile version, please visit the v2rayNG \
+> NexusLink 是电脑版，手机版请访问 v2rayNG
 >
-> https://github.com/2dust/NexusLinkG
+> https://github.com/2dust/v2rayNG
 
 ---
 
@@ -38,7 +57,7 @@ Read the Wiki for usage guides and configuration details.
 
 请阅读 Wiki 获取使用说明和配置教程。
 
-[https://github.com/2dust/NexusLink/wiki](https://github.com/2dust/NexusLink/wiki)
+[https://github.com/2dust/v2rayN/wiki](https://github.com/2dust/v2rayN/wiki)
 
 ---
 
@@ -50,7 +69,7 @@ Read the Wiki for usage guides and configuration details.
 | Linux | ✅ | - | ✅ | ✅ | ✅ |
 | macOS | ✅ | - | ✅ | - | - |
 
-Minimum OS requirements: [Release files introduction](https://github.com/2dust/NexusLink/wiki/Release-files-introduction) / 最低系统要求：[发布文件介绍](https://github.com/2dust/NexusLink/wiki/Release-files-introduction)
+Minimum OS requirements: [Release files introduction](https://github.com/2dust/v2rayN/wiki/Release-files-introduction) / 最低系统要求：[发布文件介绍](https://github.com/2dust/v2rayN/wiki/Release-files-introduction)
 
 ---
 
@@ -70,10 +89,6 @@ Release files are signed with GPG to verify authenticity and integrity, helping 
 ---
 
 ## Community / 社区
-
-Telegram Group / Telegram 群组：
-
-[https://t.me/NexusLink](https://t.me/NexusLink)
 
 Telegram Channel / Telegram 频道：
 

@@ -12,12 +12,12 @@ namespace ServiceLib.Services;
 /// <summary>
 /// 畅连内置节点管家（NexusLink Keeper）：
 /// 换血 = mihomo 分层池管线：抓全球公益池 → TCP 预筛 → mihomo 真测速(Google 204) →
-///   隔离晋升（连续可用且 &lt;800ms）进 Primary-Pool（高质量）→ 其余进 Backup-Pool（备用）→
-///   Primary-Pool(url-test) / Backup-Pool(url-test) / Standby-Pool(fallback) 分层兜底配置落盘，
+///   隔离晋升（连续可用且 &lt;800ms）进 Primary-Pool（高质量）→ 其余进 Backup-Pool（备用）；
+///   分层结果落盘为 quality.yaml / backup.yaml（仅留档，mihomo 兜底接管已移除）。
 ///   Top3 高质量节点导入畅连主池（sing-box 原生策略组）。
 /// 守卫 = 启动防抖（核心就绪+宽限期内不判定）+ 滑动窗口迟滞（连续 N 次 bad 才动作）+
-///   池内补位（Topup：切换到池内最快节点，不全量换血）+ 兜底接管（主核心失联 → mihomo 分层池接管 10808，
-///   主核心恢复自动归还）+ 告警（备用池也全垃圾时保留现有连接并告警）。
+///   池内补位（Topup：切换到池内最快节点，不全量换血）+
+///   告警（备用池也全垃圾时保留现有连接并告警）。
 /// </summary>
 public sealed class KeeperService
 {
@@ -890,62 +890,7 @@ public sealed class KeeperService
             await File.WriteAllTextAsync(Path.Combine(WorkDir, "backup.yaml"), BuildClashYaml(backupProxies));
             Logging.SaveLog($"KeeperService refresh: pools written quality={qualityProxies.Count} backup={backupProxies.Count}");
 
-            // 5. 分层兜底配置演练：Primary/Backup/Standby(fallback) 必须能启动，兜底接管才可用
-            var hc120 = $"{{enable: true, url: '{TestUrl}', interval: 120, lazy: false}}";
-            var drillCfg = string.Join("\n", new List<string>
-            {
-                $"mixed-port: {TestPort}",
-                $"external-controller: 127.0.0.1:{TestApiPort}",
-                "allow-lan: false",
-                "bind-address: 127.0.0.1",
-                "mode: rule",
-                "log-level: warning",
-                "proxy-providers:",
-                "  quality:",
-                "    type: file",
-                "    path: ./quality.yaml",
-                $"    health-check: {hc120}",
-                "  backup:",
-                "    type: file",
-                "    path: ./backup.yaml",
-                $"    health-check: {hc120}",
-                "proxy-groups:",
-                $"  - {{name: Primary-Pool, type: url-test, use: [quality], url: '{TestUrl}', interval: 120, tolerance: 100, lazy: false}}",
-                $"  - {{name: Backup-Pool, type: url-test, use: [backup], url: '{TestUrl}', interval: 120, tolerance: 100, lazy: false}}",
-                $"  - {{name: Standby-Pool, type: fallback, proxies: [Primary-Pool, Backup-Pool], url: '{TestUrl}', interval: 120, lazy: false}}",
-                "rules:",
-                "  - MATCH,Standby-Pool",
-            });
-            await File.WriteAllTextAsync(Path.Combine(WorkDir, "config-fallback.yaml"), drillCfg);
-            var drillProc = StartMihomo($"-d \"{WorkDir}\" -f config-fallback.yaml");
-            if (drillProc != null)
-            {
-                try
-                {
-                    var drillOk = false;
-                    for (var i = 0; i < 15; i++)
-                    {
-                        await Task.Delay(1000);
-                        try
-                        {
-                            var allJson = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{TestApiPort}/proxies");
-                            drillOk = JsonUtils.ParseJson(allJson)?["proxies"]?["Primary-Pool"] != null;
-                            if (drillOk)
-                            {
-                                break;
-                            }
-                        }
-                        catch { }
-                    }
-                    Logging.SaveLog(drillOk ? "KeeperService refresh: fallback drill OK (Standby-Pool layered config verified)" : "KeeperService refresh: fallback drill FAILED (config kept for retry)");
-                }
-                finally
-                {
-                    KillProc(drillProc);
-                }
-            }
-
-            // 6. 增量准入（默认）：不盲目替换旧池——只补目标带内空位，地区分散优先；
+            // 5. 增量准入（默认）：不盲目替换旧池——只补目标带内空位，地区分散优先；
             await EnsureSubItemAsync();
             var existing = await AppManager.Instance.ProfileItems(SubId) ?? [];
             var inPool = existing.Select(t => $"{t.Address.ToLowerInvariant()}:{t.Port}").ToHashSet();

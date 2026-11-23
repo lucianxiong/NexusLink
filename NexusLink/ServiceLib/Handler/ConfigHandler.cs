@@ -1459,7 +1459,7 @@ public static class ConfigHandler
         var profile = new ProfileItem
         {
             IndexId = indexId,
-            CoreType = ECoreType.Xray,
+            CoreType = ECoreType.sing_box,
             ConfigType = EConfigType.PolicyGroup,
             Remarks = remark,
             IsSub = false
@@ -1527,7 +1527,7 @@ public static class ConfigHandler
             var profile = new ProfileItem
             {
                 IndexId = indexId,
-                CoreType = ECoreType.Xray,
+                CoreType = ECoreType.sing_box,
                 ConfigType = EConfigType.PolicyGroup,
                 Remarks = remark,
                 IsSub = false

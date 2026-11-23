@@ -9,7 +9,7 @@ on:
       project:
         required: false
         type: string
-        default: './NexusLink.Desktop/NexusLink.Desktop.csproj'
+        default: './NexusLink/NexusLink.csproj'
 
 jobs:
   build:
@@ -49,7 +49,6 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v7
       with:
-        submodules: 'recursive'
         fetch-depth: '0'
 
     - name: Purge SDKs
@@ -78,10 +77,6 @@ jobs:
       working-directory: ./NexusLink
       run: dotnet publish $Project -c Release -r $RID -p:SelfContained=true $ExtOpt -o $Output
 
-    - name: Build AmazTool
-      shell: bash
-      working-directory: ./NexusLink
-      run: dotnet publish ./AmazTool/AmazTool.csproj -c Release -r $RID -p:SelfContained=true -p:PublishTrimmed=true $ExtOpt -o $Output
 
     - name: Remove Debug Symbols
       shell: bash
