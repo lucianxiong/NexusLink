@@ -9,46 +9,11 @@ internal static partial class WindowsUtils
 {
     private static readonly string _tag = "WindowsUtils";
 
-    public static string? GetClipboardData()
-    {
-        var strData = string.Empty;
-        try
-        {
-            var data = Clipboard.GetDataObject();
-            if (data?.GetDataPresent(DataFormats.UnicodeText) == true)
-            {
-                strData = data.GetData(DataFormats.UnicodeText)?.ToString();
-            }
-            return strData;
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
-        }
-        return strData;
-    }
 
-    public static void SetClipboardData(string strData)
-    {
-        try
-        {
-            Clipboard.SetText(strData);
-        }
-        catch
-        {
-        }
-    }
 
     [LibraryImport("dwmapi.dll")]
     public static partial int DwmSetWindowAttribute(nint hwnd, DWMWINDOWATTRIBUTE attribute, ref int attributeValue, uint attributeSize);
 
-    public static ImageSource IconToImageSource(Icon icon)
-    {
-        return Imaging.CreateBitmapSourceFromHIcon(
-            icon.Handle,
-            new Int32Rect(0, 0, icon.Width, icon.Height),
-            BitmapSizeOptions.FromEmptyOptions());
-    }
 
     public static void SetDarkBorder(Window window, string? theme)
     {

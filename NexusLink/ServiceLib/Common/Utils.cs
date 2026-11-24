@@ -60,17 +60,6 @@ public class Utils
         }
     }
 
-    /// <summary>
-    /// Comma-separated string, sorted and then converted to List
-    /// </summary>
-    /// <param name="str"></param>
-    /// <returns></returns>
-    public static List<string>? String2ListSorted(string str)
-    {
-        var lst = String2List(str);
-        lst?.Sort();
-        return lst;
-    }
 
     /// <summary>
     /// Base64 Encode
@@ -134,17 +123,6 @@ public class Utils
         return string.Empty;
     }
 
-    public static bool ToBool(object obj)
-    {
-        try
-        {
-            return Convert.ToBoolean(obj);
-        }
-        catch
-        {
-            return false;
-        }
-    }
 
     public static string ToString(object? obj)
     {
@@ -246,31 +224,6 @@ public class Utils
         }
     }
 
-    public static string GetFileHash(string filePath)
-    {
-        if (string.IsNullOrEmpty(filePath))
-        {
-            return string.Empty;
-        }
-
-        if (!File.Exists(filePath))
-        {
-            return string.Empty;
-        }
-
-        try
-        {
-            using var md5 = MD5.Create();
-            using var stream = File.OpenRead(filePath);
-            var hash = md5.ComputeHash(stream);
-            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
-            return string.Empty;
-        }
-    }
 
     /// <summary>
     /// idn to idc
@@ -313,40 +266,7 @@ public class Utils
         return Convert.TryFromBase64String(plainText, buffer, out var _);
     }
 
-    public static string Convert2Comma(string text)
-    {
-        if (text.IsNullOrEmpty())
-        {
-            return text;
-        }
 
-        return text.Replace("，", ",")
-                    .Replace(" ", "")
-                    .ReplaceLineBreaks(",");
-    }
-
-    public static string ParseProcess(string text)
-    {
-        if (text.IsNullOrEmpty())
-        {
-            return string.Empty;
-        }
-        if (text.StartsWith('"'))
-        {
-            text = text[1..];
-        }
-        if (text.EndsWith('"'))
-        {
-            text = text[..^1];
-        }
-        return List2String(text.Replace("，", ",")
-            .Replace("\\", "/")
-            .ReplaceLineBreaks(",")
-            .Split(',', StringSplitOptions.RemoveEmptyEntries)
-            .Select(x => x.TrimEx())
-            .Where(x => x.IsNotEmpty())
-            .ToList());
-    }
 
     public static List<string> GetEnumNames<TEnum>() where TEnum : Enum
     {
@@ -576,22 +496,6 @@ public class Utils
         return false;
     }
 
-    public static bool IsIpv4(string? ip)
-    {
-        if (ip.IsNullOrEmpty())
-        {
-            return false;
-        }
-
-        ip = ip.Trim();
-        if (!IPAddress.TryParse(ip, out var address))
-        {
-            return false;
-        }
-
-        return address.AddressFamily == AddressFamily.InterNetwork
-               && ip.Count(c => c == '.') == 3;
-    }
 
     public static bool IsIpAddress(string? ip)
     {
@@ -1153,16 +1057,6 @@ public class Utils
         return true;
     }
 
-    public static string GetPath(string fileName)
-    {
-        var startupPath = StartupPath();
-        if (fileName.IsNullOrEmpty())
-        {
-            return startupPath;
-        }
-
-        return Path.Combine(startupPath, fileName);
-    }
 
     public static string GetBaseDirectory(string fileName = "")
     {
@@ -1202,16 +1096,6 @@ public class Utils
         }
     }
 
-    public static string GetBackupPath(string filename)
-    {
-        var tempPath = Path.Combine(StartupPath(), "guiBackups");
-        if (!Directory.Exists(tempPath))
-        {
-            Directory.CreateDirectory(tempPath);
-        }
-
-        return Path.Combine(tempPath, filename);
-    }
 
     public static string GetConfigPath(string filename = "")
     {
@@ -1354,50 +1238,7 @@ public class Utils
         return false;
     }
 
-    public static bool IsPackagedInstall()
-    {
-        try
-        {
-            if (IsWindows() || IsMacOS())
-            {
-                return false;
-            }
 
-            var exePath = GetExePath();
-            var baseDir = string.IsNullOrEmpty(exePath) ? StartupPath() : Path.GetDirectoryName(exePath) ?? "";
-            var p = baseDir.Replace('\\', '/');
-
-            if (string.IsNullOrEmpty(p))
-            {
-                return false;
-            }
-
-            if (p.StartsWith("/opt/NexusLink", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-
-            if (p.StartsWith("/usr/lib/NexusLink", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-
-            if (p.StartsWith("/usr/share/NexusLink", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-        catch
-        {
-        }
-        return false;
-    }
-
-    private static async Task<string?> GetLinuxUserId()
-    {
-        var arg = new List<string>() { "-c", "id -u" };
-        return await GetCliWrapOutput(Global.LinuxBash, arg);
-    }
 
     public static async Task<string?> SetLinuxChmod(string? fileName)
     {
@@ -1456,12 +1297,6 @@ public class Utils
         return false;
     }
 
-    public static async Task<string?> GetLinuxFontFamily(string lang)
-    {
-        // var arg = new List<string>() { "-c", $"fc-list :lang={lang} family" };
-        var arg = new List<string>() { "-c", $"fc-list : family" };
-        return await GetCliWrapOutput(Global.LinuxBash, arg);
-    }
 
     public static string? GetHomePath()
     {

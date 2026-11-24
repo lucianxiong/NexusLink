@@ -33,11 +33,6 @@ public class NoticeManager
         SendMessage(content);
     }
 
-    public void SendMessageAndEnqueue(string? msg)
-    {
-        Enqueue(msg);
-        SendMessage(msg);
-    }
 
     /// <summary>
     /// Sends each error and warning in <paramref name="validatorResult"/> to the message panel

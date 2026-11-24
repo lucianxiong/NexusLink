@@ -19,9 +19,7 @@
 		<PackageReference Include="NLog" />
 		<PackageReference Include="WebDav.Client" />
 		<PackageReference Include="YamlDotNet" />
-		<PackageReference Include="QRCoder" />
 		<PackageReference Include="CliWrap" />
-		<PackageReference Include="ZXing.Net.Bindings.SkiaSharp" />
 		<PackageReference Include="TaskScheduler" />
 	</ItemGroup>
 
@@ -98,7 +96,6 @@
 	</ItemGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\ServiceLib.UdpTest\ServiceLib.UdpTest.csproj" />
     </ItemGroup>
 
 </Project>

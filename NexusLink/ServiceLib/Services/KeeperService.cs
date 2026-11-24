@@ -1858,17 +1858,6 @@ public sealed class KeeperService
     }
     }
 
-    public async Task SetEnabledAsync(bool on)
-    {
-        State.Enabled = on;
-        SaveState();
-        NoticeManager.Instance.SendMessage(on ? "畅连管家：已开启自动维护" : "畅连管家：已关闭自动维护（手动模式）");
-        if (on)
-        {
-            await EnsureGroupAsync();
-            _ = _reloadFunc?.Invoke();
-        }
-    }
 
     public async Task SetAutoSwitchAsync(bool on)
     {

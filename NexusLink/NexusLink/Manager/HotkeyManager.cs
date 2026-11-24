@@ -87,18 +87,6 @@ public sealed partial class HotkeyManager
         }
     }
 
-    public void ReLoad()
-    {
-        foreach (var hotkey in _hotkeyTriggerDic.Keys)
-        {
-            Application.Current?.Dispatcher.Invoke(() =>
-            {
-                UnregisterHotKey(nint.Zero, hotkey);
-            });
-        }
-        Init();
-        Load();
-    }
 
     private (int fsModifiers, int vKey, string hotkeyStr, List<string> Names) GetHotkeyInfo(int hotkeyCode)
     {
@@ -169,9 +157,6 @@ public sealed partial class HotkeyManager
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool RegisterHotKey(nint hWnd, int id, int fsModifiers, int vlc);
 
-    [LibraryImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool UnregisterHotKey(nint hWnd, int id);
 
     [Flags]
     private enum KeyModifiers

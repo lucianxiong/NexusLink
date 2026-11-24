@@ -18,10 +18,6 @@ public class ProfileExManager
         await InitData();
     }
 
-    public async Task<ConcurrentBag<ProfileExItem>> GetProfileExs()
-    {
-        return await Task.FromResult(_lstProfileEx);
-    }
 
     private async Task InitData()
     {
@@ -106,11 +102,6 @@ public class ProfileExManager
         return _lstProfileEx.FirstOrDefault(t => t.IndexId == indexId) ?? AddProfileEx(indexId);
     }
 
-    public async Task ClearAll()
-    {
-        await SQLiteHelper.Instance.ExecuteAsync($"delete from ProfileExItem ");
-        _lstProfileEx = [];
-    }
 
     public async Task SaveTo()
     {
@@ -132,21 +123,7 @@ public class ProfileExManager
         IndexIdEnqueue(indexId);
     }
 
-    public void SetTestSpeed(string indexId, decimal speed)
-    {
-        var profileEx = GetProfileExItem(indexId);
 
-        profileEx.Speed = speed;
-        IndexIdEnqueue(indexId);
-    }
-
-    public void SetTestMessage(string indexId, string message)
-    {
-        var profileEx = GetProfileExItem(indexId);
-
-        profileEx.Message = message;
-        IndexIdEnqueue(indexId);
-    }
 
     public void SetTestIpInfo(string indexId, string ipInfo)
     {
@@ -164,15 +141,6 @@ public class ProfileExManager
         IndexIdEnqueue(indexId);
     }
 
-    public int GetSort(string indexId)
-    {
-        var profileEx = _lstProfileEx.FirstOrDefault(t => t.IndexId == indexId);
-        if (profileEx == null)
-        {
-            return 0;
-        }
-        return profileEx.Sort;
-    }
 
     public int GetMaxSort()
     {

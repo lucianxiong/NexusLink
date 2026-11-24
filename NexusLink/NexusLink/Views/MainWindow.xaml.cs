@@ -21,7 +21,6 @@ public partial class MainWindow
     private static extern bool SetWindowPos(nint window, nint after, int x, int y, int width, int height, uint flags);
 
     private static Config _config;
-    private CheckUpdateView? _checkUpdateView;
 
     public MainWindow()
     {
@@ -40,51 +39,16 @@ public partial class MainWindow
 
         App.Current.SessionEnding += Current_SessionEnding;
         Closing += MainWindow_Closing;
-        PreviewKeyDown += MainWindow_PreviewKeyDown;
 
 
         this.WhenActivated(disposables =>
         {
-            //servers
-
-            //sub
-
-            //setting
-                                                                                                                        
-
-
-
-
             this.WhenAnyValue(v => v.ViewModel.StatusBarViewModel)
                 .Subscribe(vm => ViewHost.Show(contentStatusBarView, vm))
                 .DisposeWith(disposables);
 
-            ViewModel.ReadTextFromClipboardInteraction.RegisterHandler(interaction =>
-            {
-                var clipboardData = WindowsUtils.GetClipboardData();
-                interaction.SetOutput(clipboardData);
-            }).DisposeWith(disposables);
 
-            ViewModel.ScanScreenInteraction.RegisterHandler(interaction =>
-            {
-                ShowHideWindow(false);
-                if (Application.Current?.MainWindow is { } window)
-                {
-                    var bytes = QRCodeWindowsUtils.CaptureScreen(window);
-                    interaction.SetOutput(bytes);
-                }
-                ShowHideWindow(true);
-            }).DisposeWith(disposables);
 
-            ViewModel.BrowseImageFileInteraction.RegisterHandler(interaction =>
-            {
-                if (UI.OpenFileDialog(out var fileName, "PNG|*.png|All|*.*") != true)
-                {
-                    interaction.SetOutput(null);
-                    return;
-                }
-                interaction.SetOutput(fileName);
-            }).DisposeWith(disposables);
 
             ViewModel.ShowHideWindowInteraction.RegisterHandler(interaction =>
             {
@@ -175,69 +139,6 @@ public partial class MainWindow
     {
         Application.Current.Shutdown();
     }
-
-    private void MainWindow_PreviewKeyDown(object sender, KeyEventArgs e)
-    {
-        if (Keyboard.IsKeyDown(Key.LeftCtrl) || Keyboard.IsKeyDown(Key.RightCtrl))
-        {
-            switch (e.Key)
-            {
-                case Key.V:
-                    if (Keyboard.FocusedElement is TextBox)
-                    {
-                        return;
-                    }
-                    AddServerViaClipboardAsync().ContinueWith(_ => { });
-
-                    break;
-
-                case Key.S:
-                    ScanScreenTaskAsync().ContinueWith(_ => { });
-                    break;
-            }
-        }
-        else
-        {
-            if (e.Key == Key.F5)
-            {
-                ViewModel?.Reload();
-            }
-        }
-    }
-
-
-    public async Task AddServerViaClipboardAsync()
-    {
-        var clipboardData = WindowsUtils.GetClipboardData();
-        if (clipboardData.IsNotEmpty() && ViewModel != null)
-        {
-            await ViewModel.AddServerViaClipboardAsync(clipboardData);
-        }
-    }
-
-    private async Task ScanScreenTaskAsync()
-    {
-        ShowHideWindow(false);
-
-        if (Application.Current?.MainWindow is Window window)
-        {
-            var bytes = QRCodeWindowsUtils.CaptureScreen(window);
-            await ViewModel?.ScanScreenResult(bytes);
-        }
-
-        ShowHideWindow(true);
-    }
-
-    private void MenuCheckUpdate_Click(object sender, RoutedEventArgs e)
-    {
-        _checkUpdateView ??= new CheckUpdateView();
-        _checkUpdateView.ViewModel = ViewModel?.CheckUpdateViewModel;
-        DialogHost.Show(_checkUpdateView, "RootDialog");
-
-        AppEvents.HasUpdateNotified.Publish(false);
-    }
-
-
     #endregion Event
 
     #region UI

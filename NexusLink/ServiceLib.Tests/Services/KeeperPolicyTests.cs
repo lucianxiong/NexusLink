@@ -208,7 +208,7 @@ public class KeeperPolicyTests
         await ServiceLib.Handler.TunModeSwitch.StartupAction(true, true).Should().BeEqualTo(ServiceLib.Handler.TunStartupAction.None);
         await ServiceLib.Handler.TunModeSwitch.StartupAction(true, false).Should().BeEqualTo(ServiceLib.Handler.TunStartupAction.RequestElevation);
 
-        var config = new Config { TunModeItem = new TunModeItem() };
+        var config = new Config { TunModeItem = new TunModeItem { EnableTun = false } };
         // 管理员：直接开启
         await ServiceLib.Handler.TunModeSwitch.Apply(config, true, true, null).Should().BeEqualTo(ServiceLib.Handler.TunSwitchResult.Applied);
         await config.TunModeItem.EnableTun.Should().BeTrue();
@@ -222,6 +222,13 @@ public class KeeperPolicyTests
         // 非管理员 + 拒绝提权：回退为关闭
         await ServiceLib.Handler.TunModeSwitch.Apply(config, true, false, () => false).Should().BeEqualTo(ServiceLib.Handler.TunSwitchResult.Denied);
         await config.TunModeItem.EnableTun.Should().BeFalse();
+    }
+
+    // ---- 新安装默认开启 TUN（可在设置里关闭）----
+    [Test]
+    public async Task TunDefaultOnForFreshInstall()
+    {
+        await (new TunModeItem().EnableTun).Should().BeTrue();
     }
 
     // ---- 防抖：全池都超延迟上限时，在用节点不明显差于最优（≤1.3 倍）就保持；差太多或有达标节点才切 ----

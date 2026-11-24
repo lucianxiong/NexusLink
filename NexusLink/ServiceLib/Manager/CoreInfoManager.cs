@@ -50,33 +50,8 @@ public sealed class CoreInfoManager
         return fileName;
     }
 
-    public List<ECoreType> GetCheckUpdateCoreTypes()
-    {
-        // 畅连独立版：不提供任何程序更新（geo 缺失时仍会按需下载）
-        return [];
-    }
 
-    public bool IsCheckUpdateSupported(ECoreType type)
-    {
-        return type switch
-        {
-            ECoreType.NexusLink => !Utils.IsPackagedInstall(),
-            ECoreType.Xray => true,
-            ECoreType.mihomo => true,
-            ECoreType.sing_box => true,
-            _ => false,
-        };
-    }
 
-    public bool GetCheckPreRelease(ECoreType type, bool preRelease)
-    {
-        return type switch
-        {
-            ECoreType.NexusLink => preRelease,
-            ECoreType.Xray => preRelease,
-            _ => false,
-        };
-    }
 
     private void InitCoreInfo()
     {

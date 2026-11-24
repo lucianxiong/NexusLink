@@ -36,25 +36,9 @@ public sealed class AppManager
 
     public ECoreType RunningCoreType { get; set; }
 
-    public bool IsRunningCore(ECoreType type)
-    {
-        switch (type)
-        {
-            case ECoreType.Xray when RunningCoreType is ECoreType.Xray or ECoreType.v2fly or ECoreType.v2fly_v5:
-            case ECoreType.sing_box when RunningCoreType is ECoreType.sing_box or ECoreType.mihomo:
-                return true;
-
-            default:
-                return false;
-        }
-    }
 
     public Dictionary<ECoreType, string> LastCheckUpdateResults { get; set; } = new();
 
-    public void SetLastCheckUpdateResult(ECoreType coreType, string result)
-    {
-        LastCheckUpdateResults[coreType] = result;
-    }
 
     #endregion Property
 
@@ -133,11 +117,9 @@ public sealed class AppManager
 
             await ConfigHandler.SaveConfig(_config);
             await ProfileExManager.Instance.SaveTo();
-            await StatisticsManager.Instance.SaveTo();
             KeeperService.Instance.Shutdown();
             await CoreManager.Instance.CoreStop();
             CoreManager.Instance.KillLeftoverCores();
-            StatisticsManager.Instance.Close();
 
             Logging.SaveLog("AppExitAsync End");
         }
@@ -198,40 +180,6 @@ public sealed class AppManager
         }
     }
 
-    public async Task<List<string>?> ProfileItemIndexes(string subid)
-    {
-        return (await ProfileItems(subid))?.Select(t => t.IndexId)?.ToList();
-    }
-
-    public async Task<List<ProfileItemModel>?> ProfileModels(string subid, string filter)
-    {
-        var sql = @$"select a.IndexId
-                           ,a.ConfigType
-                           ,a.Remarks
-                           ,a.Address
-                           ,a.Port
-                           ,a.Network
-                           ,a.StreamSecurity
-                           ,a.Subid
-                           ,b.remarks as subRemarks
-                        from ProfileItem a
-                        left join SubItem b on a.subid = b.id
-                        where 1=1 ";
-        if (subid.IsNotEmpty())
-        {
-            sql += $" and a.subid = '{subid}'";
-        }
-        if (filter.IsNotEmpty())
-        {
-            if (filter.Contains('\''))
-            {
-                filter = filter.Replace("'", "");
-            }
-            sql += string.Format(" and (a.remarks like '%{0}%' or a.address like '%{0}%') ", filter);
-        }
-
-        return await SQLiteHelper.Instance.QueryAsync<ProfileItemModel>(sql);
-    }
 
     public async Task<ProfileItem?> GetProfileItem(string indexId)
     {
@@ -271,12 +219,6 @@ public sealed class AppManager
         return items;
     }
 
-    public async Task<Dictionary<string, ProfileItem>> GetProfileItemsByIndexIdsAsMap(IEnumerable<string> indexIds)
-    {
-        var items = await GetProfileItemsByIndexIds(indexIds);
-        return items.ToDictionary(it => it.IndexId);
-    }
-
     public async Task<List<ProfileItem>> GetProfileItemsOrderedByIndexIds(IEnumerable<string> indexIds)
     {
         var ids = indexIds.Where(id => !id.IsNullOrEmpty()).Distinct().ToList();
@@ -300,11 +242,6 @@ public sealed class AppManager
     public async Task<List<RoutingItem>?> RoutingItems()
     {
         return await SQLiteHelper.Instance.TableAsync<RoutingItem>().OrderBy(t => t.Sort).ToListAsync();
-    }
-
-    public async Task<RoutingItem?> GetRoutingItem(string id)
-    {
-        return await SQLiteHelper.Instance.TableAsync<RoutingItem>().FirstOrDefaultAsync(it => it.Id == id);
     }
 
     public async Task<List<DNSItem>?> DNSItems()

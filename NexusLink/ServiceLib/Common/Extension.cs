@@ -20,31 +20,12 @@ public static class Extension
         return string.IsNullOrWhiteSpace(value) ? null : value;
     }
 
-    public static bool BeginWithAny(this string s, IEnumerable<char> chars)
-    {
-        if (s.IsNullOrEmpty())
-        {
-            return false;
-        }
-        return chars.Contains(s.First());
-    }
 
     private static bool IsWhiteSpace(this string value)
     {
         return value.All(char.IsWhiteSpace);
     }
 
-    public static IEnumerable<string> NonWhiteSpaceLines(this TextReader reader)
-    {
-        while (reader.ReadLine() is { } line)
-        {
-            if (line.IsWhiteSpace())
-            {
-                continue;
-            }
-            yield return line;
-        }
-    }
 
     public static string TrimEx(this string? value)
     {
@@ -61,15 +42,6 @@ public static class Extension
         return value.StartsWith(prefix) ? value[prefix.Length..] : value;
     }
 
-    public static string UpperFirstChar(this string value)
-    {
-        if (string.IsNullOrEmpty(value))
-        {
-            return string.Empty;
-        }
-
-        return char.ToUpper(value.First()) + value[1..];
-    }
 
     public static string AppendQuotes(this string value)
     {
@@ -81,10 +53,6 @@ public static class Extension
         return int.TryParse(value, out var result) ? result : defaultValue;
     }
 
-    public static List<string> AppendEmpty(this IEnumerable<string> source)
-    {
-        return source.Concat(new[] { string.Empty }).ToList();
-    }
 
     public static bool IsGroupType(this EConfigType configType)
     {

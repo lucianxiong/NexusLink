@@ -12,8 +12,6 @@ public partial class StatusBarView
         _config = AppManager.Instance.Config;
 
         menuExit.Click += menuExit_Click;
-        txtRunningServerDisplay.PreviewMouseDown += txtRunningInfoDisplay_MouseDoubleClick;
-        txtRunningInfoDisplay.PreviewMouseDown += txtRunningInfoDisplay_MouseDoubleClick;
 
         this.WhenActivated(disposables =>
         {
@@ -21,26 +19,8 @@ public partial class StatusBarView
             tbNotify.ToolTipText = "畅连";
             this.OneWayBind(ViewModel, vm => vm.NotifyLeftClickCmd, v => v.tbNotify.LeftClickCommand).DisposeWith(disposables);
 
-            //status bar
-            this.OneWayBind(ViewModel, vm => vm.InboundDisplay, v => v.txtInboundDisplay.Text).DisposeWith(disposables);
-            this.OneWayBind(ViewModel, vm => vm.InboundLanDisplay, v => v.txtInboundLanDisplay.Text).DisposeWith(disposables);
-            this.OneWayBind(ViewModel, vm => vm.RunningServerDisplay, v => v.txtRunningServerDisplay.Text).DisposeWith(disposables);
-            this.OneWayBind(ViewModel, vm => vm.RunningInfoDisplay, v => v.txtRunningInfoDisplay.Text).DisposeWith(disposables);
-            this.OneWayBind(ViewModel, vm => vm.SpeedProxyDisplay, v => v.txtSpeedProxyDisplay.Text).DisposeWith(disposables);
-            this.OneWayBind(ViewModel, vm => vm.SpeedDirectDisplay, v => v.txtSpeedDirectDisplay.Text).DisposeWith(disposables);
-            this.Bind(ViewModel, vm => vm.EnableTun, v => v.togEnableTun.IsChecked).DisposeWith(disposables);
 
-            this.Bind(ViewModel, vm => vm.SystemProxySelected, v => v.cmbSystemProxy.SelectedIndex).DisposeWith(disposables);
-            this.OneWayBind(ViewModel, vm => vm.RoutingItems, v => v.cmbRoutings2.ItemsSource).DisposeWith(disposables);
-            this.Bind(ViewModel, vm => vm.SelectedRouting, v => v.cmbRoutings2.SelectedItem).DisposeWith(disposables);
-            this.OneWayBind(ViewModel, vm => vm.BlRouting, v => v.cmbRoutings2.Visibility).DisposeWith(disposables);
 
-            ViewModel.SetClipboardDataInteraction.RegisterHandler(interaction =>
-            {
-                var strData = interaction.Input;
-                WindowsUtils.SetClipboardData(strData);
-                interaction.SetOutput(RxVoid.Default);
-            }).DisposeWith(disposables);
 
             ViewModel.DispatcherRefreshIconInteraction.RegisterHandler(interaction =>
             {
@@ -105,10 +85,6 @@ public partial class StatusBarView
         await AppManager.Instance.AppExitAsync(true);
     }
 
-    private void txtRunningInfoDisplay_MouseDoubleClick(object sender, MouseButtonEventArgs e)
-    {
-        ViewModel?.TestServerAvailability();
-    }
 }
 
 

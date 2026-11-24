@@ -17,38 +17,6 @@ public class DownloadService
 
     private static readonly string _tag = "DownloadService";
 
-    /// <summary>
-    /// Downloads data with the specified proxy and reports progress messages.
-    /// </summary>
-    public async Task<int> DownloadDataAsync(string url, IWebProxy webProxy, Func<bool, string, Task> updateFunc, CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            await DownloaderHelper.Instance.DownloadDataAsync4Speed(webProxy,
-                  url,
-                  OnProgress,
-                  cancellationToken);
-
-            void OnProgress(string message)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                updateFunc.Invoke(false, $"{message}");
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            await updateFunc.Invoke(false, ex.Message);
-            if (ex.InnerException != null)
-            {
-                await updateFunc.Invoke(false, ex.InnerException.Message);
-            }
-        }
-        return 0;
-    }
 
     /// <summary>
     /// Downloads a file and reports progress through events.
@@ -158,36 +126,6 @@ public class DownloadService
         }
     }
 
-    /// <summary>
-    /// Gets redirect target URL without following redirects automatically.
-    /// </summary>
-    public async Task<string?> UrlRedirectAsync(string url, bool blProxy, CancellationToken cancellationToken = default)
-    {
-        var webRequestHandler = new SocketsHttpHandler
-        {
-            AllowAutoRedirect = false,
-            Proxy = await GetWebProxy(blProxy, cancellationToken)
-        };
-        var certificateChainPolicy = CertPemManager.Instance.BuildCertificateChainPolicy();
-        if (certificateChainPolicy != null)
-        {
-            webRequestHandler.SslOptions.CertificateChainPolicy = certificateChainPolicy;
-            webRequestHandler.SslOptions.RemoteCertificateValidationCallback = null;
-        }
-        using var client = new HttpClient(webRequestHandler);
-
-        var response = await client.GetAsync(url, cancellationToken);
-        if (response.StatusCode == HttpStatusCode.Redirect && response.Headers.Location is not null)
-        {
-            return response.Headers.Location.ToString();
-        }
-        else
-        {
-            Error?.Invoke(this, new ErrorEventArgs(new Exception("StatusCode error: " + response.StatusCode)));
-            Logging.SaveLog("StatusCode error: " + url);
-            return null;
-        }
-    }
 
     /// <summary>
     /// Tries to download string content using proxy switch setting.

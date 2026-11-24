@@ -73,30 +73,4 @@ public sealed class SQLiteHelper
         return _dbAsync.Table<T>();
     }
 
-    public async Task DisposeDbConnectionAsync()
-    {
-        await Task.Run(() =>
-        {
-            try
-            {
-                _db?.Close();
-                _db?.Dispose();
-            }
-            finally
-            {
-                _db = null;
-            }
-
-            try
-            {
-                var conn = _dbAsync?.GetConnection();
-                conn?.Close();
-                conn?.Dispose();
-            }
-            finally
-            {
-                _dbAsync = null;
-            }
-        });
-    }
 }

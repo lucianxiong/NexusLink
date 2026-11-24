@@ -7,19 +7,6 @@ public static class FileUtils
 {
     private static readonly string _tag = "FileManager";
 
-    public static bool ByteArrayToFile(string fileName, byte[] content)
-    {
-        try
-        {
-            File.WriteAllBytes(fileName, content);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
-        }
-        return false;
-    }
 
     public static void DecompressFile(string fileName, byte[] content)
     {
@@ -51,19 +38,6 @@ public static class FileUtils
         }
     }
 
-    public static void DecompressTarFile(string fileName, string toPath)
-    {
-        try
-        {
-            using var fs = new FileStream(fileName, FileMode.Open, FileAccess.Read);
-            using var gz = new GZipStream(fs, CompressionMode.Decompress, leaveOpen: true);
-            TarFile.ExtractToDirectory(gz, toPath, overwriteFiles: true);
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
-        }
-    }
 
     public static string NonExclusiveReadAllText(string path)
     {
@@ -85,56 +59,7 @@ public static class FileUtils
         }
     }
 
-    public static bool ZipExtractToFile(string fileName, string toPath, string ignoredName)
-    {
-        try
-        {
-            using var archive = ZipFile.OpenRead(fileName);
-            foreach (var entry in archive.Entries)
-            {
-                if (entry.Length == 0)
-                {
-                    continue;
-                }
-                try
-                {
-                    if (ignoredName.IsNotEmpty() && entry.Name.Contains(ignoredName))
-                    {
-                        continue;
-                    }
-                    entry.ExtractToFile(Path.Combine(toPath, entry.Name), true);
-                }
-                catch (IOException ex)
-                {
-                    Logging.SaveLog(_tag, ex);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
-            return false;
-        }
-        return true;
-    }
 
-    public static List<string>? GetFilesFromZip(string fileName)
-    {
-        if (!File.Exists(fileName))
-        {
-            return null;
-        }
-        try
-        {
-            using var archive = ZipFile.OpenRead(fileName);
-            return archive.Entries.Select(entry => entry.FullName).ToList();
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
-            return null;
-        }
-    }
 
     public static bool CreateFromDirectory(string sourceDirectoryName, string destinationArchiveFileName)
     {

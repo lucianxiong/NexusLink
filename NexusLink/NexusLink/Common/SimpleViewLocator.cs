@@ -1,6 +1,5 @@
-using NexusLink.ViewModels;
-using NexusLink.Views;
 
+using NexusLink.Views;
 namespace NexusLink.Common;
 
 public class SimpleViewLocator : IViewLocator
@@ -10,27 +9,9 @@ public class SimpleViewLocator : IViewLocator
 
     private SimpleViewLocator()
     {
-        Register<AddGroupServerViewModel, AddGroupServerWindow>();
-        Register<AddServer2ViewModel, AddServer2Window>();
-        Register<AddServerViewModel, AddServerWindow>();
-        Register<BackupAndRestoreViewModel, BackupAndRestoreView>();
-        Register<CheckUpdateViewModel, CheckUpdateView>();
-        Register<ClashConnectionsViewModel, ClashConnectionsView>();
-        Register<ClashProxiesViewModel, ClashProxiesView>();
-        Register<DNSSettingViewModel, DNSSettingWindow>();
-        Register<FullConfigTemplateViewModel, FullConfigTemplateWindow>();
-        Register<GlobalHotkeySettingViewModel, GlobalHotkeySettingWindow>();
         Register<MainWindowViewModel, MainWindow>();
-        Register<MsgViewModel, MsgView>();
         Register<OptionSettingViewModel, OptionSettingWindow>();
-        Register<ProfilesSelectViewModel, ProfilesSelectWindow>();
-        Register<ProfilesViewModel, ProfilesView>();
-        Register<RoutingRuleDetailsViewModel, RoutingRuleDetailsWindow>();
-        Register<RoutingRuleSettingViewModel, RoutingRuleSettingWindow>();
-        Register<RoutingSettingViewModel, RoutingSettingWindow>();
         Register<StatusBarViewModel, StatusBarView>();
-        Register<SubEditViewModel, SubEditWindow>();
-        Register<SubSettingViewModel, SubSettingWindow>();
     }
 
     public static SimpleViewLocator Instance => _instance.Value;

@@ -11,10 +11,6 @@ internal class UI
         MessageBox.Show(msg, caption, MessageBoxButton.OK, MessageBoxImage.Information, MessageBoxResult.OK);
     }
 
-    public static MessageBoxResult ShowYesNo(string msg)
-    {
-        return MessageBox.Show(msg, caption, MessageBoxButton.YesNo, MessageBoxImage.Question);
-    }
 
     public static bool? OpenFileDialog(out string fileName, string filter)
     {

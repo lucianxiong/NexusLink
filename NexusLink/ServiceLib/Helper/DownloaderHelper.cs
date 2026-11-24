@@ -54,69 +54,6 @@ public class DownloaderHelper
         return await reader.ReadToEndAsync(cancellationToken);
     }
 
-    public async Task DownloadDataAsync4Speed(IWebProxy webProxy, string url, Action<string> onProgress, CancellationToken cancellationToken = default)
-    {
-        if (url.IsNullOrEmpty())
-        {
-            throw new ArgumentNullException(nameof(url));
-        }
-
-        var requestConfiguration = new RequestConfiguration()
-        {
-            ConnectTimeout = GetConnectTimeoutMs(true),
-            Proxy = webProxy
-        };
-        var downloadOpt = new DownloadConfiguration()
-        {
-            MaxTryAgainOnFailure = 2,
-            RequestConfiguration = requestConfiguration,
-            CustomHttpMessageHandlerFactory = () => GetSocketsHttpHandler(requestConfiguration),
-        };
-
-        var lastUpdateTime = DateTime.Now;
-        var hasValue = false;
-        double maxSpeed = 0;
-        await using var downloader = new Downloader.DownloadService(downloadOpt);
-
-        downloader.DownloadProgressChanged += (sender, value) =>
-        {
-            if (!(value.BytesPerSecondSpeed > 0))
-            {
-                return;
-            }
-            hasValue = true;
-            if (value.BytesPerSecondSpeed > maxSpeed)
-            {
-                maxSpeed = value.BytesPerSecondSpeed;
-            }
-
-            var ts = DateTime.Now - lastUpdateTime;
-            if (ts.TotalMilliseconds >= 1000)
-            {
-                lastUpdateTime = DateTime.Now;
-                var speed = (maxSpeed / 1000 / 1000).ToString("#0.0");
-                onProgress.Invoke(speed);
-            }
-        };
-        downloader.DownloadFileCompleted += (sender, value) =>
-        {
-            if (hasValue && maxSpeed > 0)
-            {
-                var finalSpeed = (maxSpeed / 1000 / 1000).ToString("#0.0");
-                onProgress.Invoke(finalSpeed);
-            }
-            else if (value.Error != null)
-            {
-                onProgress.Invoke(value.Error?.Message);
-            }
-            else
-            {
-                onProgress.Invoke("0");
-            }
-        };
-        //progress.Invoke("......");
-        await using var stream = await downloader.DownloadFileTaskAsync(address: url, cancellationToken);
-    }
 
     public async Task DownloadFileAsync(IWebProxy? webProxy, FileDownloadRequest request, Action<FileDownloadState> onProgress, CancellationToken cancellationToken = default)
     {

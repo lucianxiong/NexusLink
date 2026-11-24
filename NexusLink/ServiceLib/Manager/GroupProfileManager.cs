@@ -124,15 +124,6 @@ public class GroupProfileManager
             .ToList() ?? [];
     }
 
-    public static async Task<Dictionary<string, ProfileItem>> GetAllChildProfileItems(ProfileItem profileItem)
-    {
-        var itemMap = new Dictionary<string, ProfileItem>();
-        var visited = new HashSet<string>();
-
-        await CollectChildItems(profileItem, itemMap, visited);
-
-        return itemMap;
-    }
 
     private static async Task CollectChildItems(ProfileItem profileItem, Dictionary<string, ProfileItem> itemMap,
         HashSet<string> visited)

@@ -255,29 +255,7 @@ public class CertPemManager
         return certs;
     }
 
-    /// <summary>
-    ///     Concatenate a list of PEM certificates into a single string
-    /// </summary>
-    /// <param name="pemList">List of individual PEM certificate strings</param>
-    /// <returns>Concatenated PEM certificates string</returns>
-    public static string ConcatenatePemChain(IEnumerable<string>? pemList)
-    {
-        return pemList == null ? string.Empty : string.Concat(pemList);
-    }
 
-    public static string GetCertSha256Thumbprint(string pemCert, bool includeColon = false)
-    {
-        try
-        {
-            var cert = X509Certificate2.CreateFromPem(pemCert);
-            var thumbprint = cert.GetCertHashString(HashAlgorithmName.SHA256);
-            return includeColon ? string.Join(":", thumbprint.Chunk(2).Select(c => new string(c))) : thumbprint;
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
 
     public static string GetLeafCertSha256Thumbprint(string pemCertChain, bool includeColon = false)
     {
