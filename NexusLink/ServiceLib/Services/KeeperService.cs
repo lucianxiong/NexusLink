@@ -544,7 +544,7 @@ public sealed class KeeperService
                     }
                 }
             }
-            State.Nodes = items.Select(t => new KeeperNode { Remarks = t.Remarks, Host = t.Address, Port = t.Port, QualityKey = GetQualityKey(t) }).ToList();
+            State.Nodes = BuildNodes(items);
             State.LastAlive = items.Count;
             SaveState();
             NoticeManager.Instance.SendMessage($"畅连管家：池子体检完成——{items.Count} 条在池，本轮降级 {toRemove.Count} 条");
@@ -640,8 +640,11 @@ public sealed class KeeperService
             // 1. fetch pools
             var links = new List<string>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
+            var sourceByHostPort = new Dictionary<string, string>(StringComparer.Ordinal); // 节点 host:port → 来源池短名
+            var rejectedReasons = new Dictionary<string, int>(); // 被安全闸拦下的节点按原因计数
+            var poolUrls = State.Pools.Distinct().Take(20).ToList();
             RefreshStatus = "正在更新节点来源";
-            var catalogs = await Task.WhenAll(State.Pools.Distinct().Take(20).Select(async url =>
+            var catalogs = await Task.WhenAll(poolUrls.Select(async url =>
             {
                 var body = await FetchPoolAsync(url);
                 return body == null ? [] : ExtractLinks(body).ToArray();
@@ -651,18 +654,29 @@ public sealed class KeeperService
             var maxLength = catalogs.Select(catalog => catalog.Length).DefaultIfEmpty().Max();
             for (var i = 0; i < maxLength && links.Count < State.MaxCandidates; i++)
             {
-                foreach (var catalog in catalogs.Where(catalog => i < catalog.Length))
+                for (var ci = 0; ci < catalogs.Length; ci++)
                 {
+                    var catalog = catalogs[ci];
+                    if (i >= catalog.Length)
+                    {
+                        continue;
+                    }
                     var link = catalog[i];
                     var proxy = ParsePoolCandidate(link);
                     if (proxy == null)
                     {
+                        CountSecurityRejection(link, rejectedReasons);
                         continue;
                     }
                     var identity = JsonSerializer.Serialize(proxy.Where(entry => entry.Key != "name").OrderBy(entry => entry.Key));
                     if (seen.Add(identity))
                     {
                         links.Add(link);
+                        var sourceHp = ParseHostPort(link);
+                        if (sourceHp != null)
+                        {
+                            sourceByHostPort[$"{sourceHp.Value.host.ToLowerInvariant()}:{sourceHp.Value.port}"] = PoolShortName(poolUrls[ci]);
+                        }
                     }
                     if (links.Count >= State.MaxCandidates)
                     {
@@ -670,6 +684,16 @@ public sealed class KeeperService
                     }
                 }
             }
+            var rejectedTotal = rejectedReasons.Values.Sum();
+            var rejectedSummary = string.Join("、", rejectedReasons.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key} {kv.Value}"));
+            State.SecurityAudit = new KeeperSecurityAudit
+            {
+                At = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                Candidates = links.Count,
+                Rejected = rejectedTotal,
+                Reasons = rejectedSummary,
+            };
+            Logging.SaveLog($"KeeperService security audit: poolsOk={poolsOk}/{poolUrls.Count} candidates={links.Count} rejectedBySecurity={rejectedTotal}{(rejectedTotal > 0 ? $" ({rejectedSummary})" : string.Empty)} minSecurity={State.MinSecurity}");
             if (links.Count < State.MinAlive)
             {
                 Logging.SaveLog($"KeeperService refresh FAILED: poolsOk={poolsOk}/{State.Pools.Count} links={links.Count} (insufficient)");
@@ -678,7 +702,9 @@ public sealed class KeeperService
             }
 
             // 2. TCP prefilter (parallel, 3s) — 只做廉价的初筛，绝不做质量判定
-            RefreshStatus = $"正在检查 {links.Count} 个节点的端口";
+            RefreshStatus = rejectedTotal > 0
+                ? $"正在检查 {links.Count} 个节点的端口 · 已拦截 {rejectedTotal} 个不安全节点"
+                : $"正在检查 {links.Count} 个节点的端口";
             var alive = new ConcurrentBag<(int rtt, string link)>();
             using var sem = new SemaphoreSlim(16);
             var tasks = links.Take(State.MaxCandidates).Select(async link =>
@@ -871,7 +897,15 @@ public sealed class KeeperService
                 .Select(proxy => nameByName[(string)proxy["name"]!])
                 .Select(item => FmtHandler.ResolveConfig(item.link, out _))
                 .OfType<ProfileItem>()
-                .Select(item => new KeeperNode { Remarks = item.Remarks, Host = item.Address, Port = item.Port, QualityKey = GetQualityKey(item) })
+                .Select(item => new KeeperNode
+                {
+                    Remarks = item.Remarks,
+                    Host = item.Address,
+                    Port = item.Port,
+                    QualityKey = GetQualityKey(item),
+                    Security = EvaluateSecurity(item).Level,
+                    Source = SourceOfHostPort(sourceByHostPort, item.Address, item.Port),
+                })
                 .ToList();
             if (qualityProxies.Count == 0)
             {
@@ -934,11 +968,16 @@ public sealed class KeeperService
             }
             State.QualityLinks = qualityLinks;
 
-            // 7. security filter
+            // 7. security filter：池内已有节点按同一口径复审（老版本放进来的、链接被改过的），低安全的一律出池
             var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
-            var bad = items.Where(t => !t.IsValid() || t.GetAllowInsecure()).ToList();
+            var bad = items.Where(t => !t.IsValid() || t.GetAllowInsecure() || !SecurityAllows(t)).ToList();
             if (bad.Count > 0)
             {
+                foreach (var evicted in bad)
+                {
+                    Logging.SaveLog($"KeeperService security audit: evicted '{evicted.Remarks}' ({EvaluateSecurity(evicted).Reason})");
+                }
+                State.SecurityAudit.Evicted = bad.Count;
                 await ConfigHandler.RemoveServers(_config, bad);
                 items = items.Except(bad).ToList();
             }
@@ -953,26 +992,29 @@ public sealed class KeeperService
                     await _reloadFunc();
                 }
             }
+            else if (_config.IndexId == GroupIndexId && (importLinks.Count > 0 || bad.Count > 0) && _reloadFunc != null)
+            {
+                // 策略组按订阅筛选条件动态取成员：新节点入池、或不安全节点被剔除后，
+                // 必须重载内核，运行中的配置才会跟着变（否则要等下次切线或重启才生效）。
+                Logging.SaveLog($"KeeperService: pool membership changed (+{importLinks.Count} / -{bad.Count}), reloading core");
+                await _reloadFunc();
+            }
 
             // 9. state + reload
             State.LastRefresh = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             _lastRefreshAt = DateTime.Now;
             State.LastAlive = items.Count;
             State.Tested = parsed.Count;
-            State.Nodes = items.Select(t => new KeeperNode
-            {
-                Remarks = t.Remarks,
-                Host = t.Address,
-                Port = t.Port,
-                QualityKey = GetQualityKey(t),
-            }).ToList();
+            State.Nodes = BuildNodes(items, sourceByHostPort);
             State.BackupCount = backupProxies.Count;
             State.BackupNodes = backupNodes;
             SaveState();
-            RefreshStatus = $"刷新完成 · 已测速 {parsed.Count} 个节点";
+            RefreshStatus = State.SecurityAudit.Rejected > 0
+                ? $"刷新完成 · 已测速 {parsed.Count} 个节点 · 拦截 {State.SecurityAudit.Rejected} 个不安全节点"
+                : $"刷新完成 · 已测速 {parsed.Count} 个节点";
 
-            NoticeManager.Instance.SendMessage($"畅连管家：换血完成——真测速 {parsed.Count} 个、隔离晋升 {qualityProxies.Count} 个入主池、备用池 {backupProxies.Count} 个兜底");
-            Logging.SaveLog($"KeeperService refreshed: tested={parsed.Count} imported={items.Count} quality={qualityProxies.Count} backup={backupProxies.Count}");
+            NoticeManager.Instance.SendMessage($"畅连管家：换血完成——真测速 {parsed.Count} 个、隔离晋升 {qualityProxies.Count} 个入主池、备用池 {backupProxies.Count} 个兜底、拦截 {State.SecurityAudit.Rejected} 个不安全节点");
+            Logging.SaveLog($"KeeperService refreshed: tested={parsed.Count} pool={items.Count} quality={qualityProxies.Count} backup={backupProxies.Count} rejected={State.SecurityAudit.Rejected} evicted={bad.Count}");
             return true;
         }
         catch (Exception ex)
@@ -1392,6 +1434,137 @@ public sealed class KeeperService
         }
     }
 
+    // ------------------------------------------------------------------ security audit
+    // 节点安全分级只看节点自身的客观属性（协议、加密、传输、地址），不看来源与口碑。
+    // 「低」= 禁止注入（弱加密 / 明文 / 跳过证书校验 / 内网地址）；「中」「高」= 允许入池并在界面标注。
+    internal const string SecurityHigh = "高";
+    internal const string SecurityMedium = "中";
+    internal const string SecurityLow = "低";
+
+    private static int _minSecurityRank = 1; // State.MinSecurity 的静态镜像（候选闸是静态方法）；下限钳到 1，低永远拦
+
+    private static readonly HashSet<string> SsAeadMethods = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
+        "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
+        "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305",
+    };
+
+    internal static int SecurityRank(string level) => level switch
+    {
+        SecurityHigh => 2,
+        SecurityMedium => 1,
+        _ => 0,
+    };
+
+    internal static (string Level, string Reason) EvaluateSecurity(ProfileItem item)
+    {
+        if (item.GetAllowInsecure())
+        {
+            return (SecurityLow, "跳过证书校验（可被中间人解密篡改）");
+        }
+        var host = (item.Address ?? string.Empty).TrimEnd('.');
+        if (IPAddress.TryParse(host, out var address) && !IsPublicAddress(address))
+        {
+            return (SecurityLow, "节点地址为内网/保留地址");
+        }
+        var extra = item.GetProtocolExtra();
+        var tls = item.StreamSecurity is Global.StreamSecurity or Global.StreamSecurityReality;
+        switch (item.ConfigType)
+        {
+            case EConfigType.Shadowsocks:
+                if (!SsAeadMethods.Contains(extra.SsMethod ?? string.Empty))
+                {
+                    return (SecurityLow, $"Shadowsocks 弱加密或无认证（{(extra.SsMethod.IsNullOrEmpty() ? "未声明" : extra.SsMethod)}）");
+                }
+                return tls
+                    ? (SecurityHigh, "SS AEAD + TLS")
+                    : (SecurityMedium, "SS AEAD 直连（流量特征可识别）");
+            case EConfigType.VMess:
+                if (!tls)
+                {
+                    return (SecurityLow, "VMess 未启用 TLS（明文传输）");
+                }
+                return extra.VmessSecurity is "none" or "zero"
+                    ? (SecurityMedium, "VMess + TLS（无内层加密）")
+                    : (SecurityHigh, "VMess + TLS + AEAD");
+            case EConfigType.VLESS:
+                return tls
+                    ? (SecurityHigh, item.StreamSecurity == Global.StreamSecurityReality ? "VLESS + Reality" : "VLESS + TLS")
+                    : (SecurityLow, "VLESS 未启用 TLS（UUID 与流量明文）");
+            case EConfigType.Trojan:
+                // 链接不写 security=tls 时 sing-box 出站不会带 TLS：测速能过（mihomo 对 Trojan 默认 TLS）但真用是明文，必须拦
+                return tls
+                    ? (SecurityHigh, "Trojan + TLS")
+                    : (SecurityLow, "Trojan 未启用 TLS（口令明文）");
+            default:
+                return (SecurityLow, "不支持的协议类型");
+        }
+    }
+
+    // 是否允许注入：等级不低于门槛（ParsePoolCandidate 候选闸与池内复审共用）
+    internal static bool SecurityAllows(ProfileItem item) => SecurityRank(EvaluateSecurity(item).Level) >= _minSecurityRank;
+
+    // 候选被闸拦下时，若原因是安全等级不足则计入分布（解析失败不算安全拦截）
+    private static void CountSecurityRejection(string link, Dictionary<string, int> reasons)
+    {
+        var profile = FmtHandler.ResolveConfig(link, out _);
+        if (profile == null || !profile.IsValid())
+        {
+            return;
+        }
+        var (level, reason) = EvaluateSecurity(profile);
+        if (SecurityRank(level) < _minSecurityRank)
+        {
+            reasons[reason] = reasons.GetValueOrDefault(reason) + 1;
+        }
+    }
+
+    // 来源池短名：raw.githubusercontent.com/{owner}/{repo}/... → owner/repo；其余取主机名
+    internal static string PoolShortName(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return url;
+        }
+        if (uri.Host.EndsWith("githubusercontent.com", StringComparison.OrdinalIgnoreCase))
+        {
+            var seg = uri.AbsolutePath.Trim('/').Split('/');
+            if (seg.Length >= 2)
+            {
+                return seg[0] + "/" + seg[1];
+            }
+        }
+        return uri.Host;
+    }
+
+    private static string SourceOfHostPort(Dictionary<string, string> sourceByHostPort, string host, int port)
+        => sourceByHostPort.GetValueOrDefault($"{(host ?? string.Empty).TrimEnd('.').ToLowerInvariant()}:{port}", string.Empty);
+
+    // 池内节点 → 界面展示模型：安全等级按同口径现算，来源优先取本轮抓取记录、其次沿用上次记录
+    private List<KeeperNode> BuildNodes(List<ProfileItem> items, Dictionary<string, string>? sourceByHostPort = null)
+    {
+        var known = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var node in State.Nodes)
+        {
+            known.TryAdd(node.QualityKey, node.Source);
+        }
+        return items.Select(t =>
+        {
+            var key = GetQualityKey(t);
+            var src = sourceByHostPort != null ? SourceOfHostPort(sourceByHostPort, t.Address, t.Port) : string.Empty;
+            return new KeeperNode
+            {
+                Remarks = t.Remarks,
+                Host = t.Address,
+                Port = t.Port,
+                QualityKey = key,
+                Security = EvaluateSecurity(t).Level,
+                Source = src.Length > 0 ? src : known.GetValueOrDefault(key, string.Empty),
+            };
+        }).ToList();
+    }
+
     // ------------------------------------------------------------------ link → clash proxy (mihomo)
     private static string UrlDecode(string s) => Uri.UnescapeDataString(s ?? string.Empty);
 
@@ -1403,6 +1576,10 @@ public sealed class KeeperService
                 && profile.StreamSecurity is not ("tls" or "reality"))
         {
             return null;
+        }
+        if (!SecurityAllows(profile))
+        {
+            return null; // 安全等级低于门槛（弱加密 / 明文 / 跳过证书校验 / 内网地址）：换血与补位任何阶段都不注入
         }
 
         var host = profile.Address.TrimEnd('.');
@@ -1877,6 +2054,8 @@ public sealed class KeeperService
                 if (st != null)
                 {
                     State = st;
+                    State.SecurityAudit ??= new();
+                    _minSecurityRank = Math.Max(1, SecurityRank(State.MinSecurity));
                 }
             }
         }
@@ -1952,6 +2131,10 @@ public class KeeperState
     public int TopupIntervalHours { get; set; } = 4;      // 池健康盘点间隔（降级检查+缺员补位）
     public int RefreshIntervalHours { get; set; } = 12;   // 定时增量换血周期（12h，不盲目替换）
     public List<string> QualityLinks { get; set; } = []; // 最近一轮真测速达标链接库（补位来源）
+
+    // ---- 节点安全审查 ----
+    public string MinSecurity { get; set; } = "中"; // 注入门槛：中 = 放行「中」「高」；高 = 只放行「高」；「低」无论如何都拦截
+    public KeeperSecurityAudit SecurityAudit { get; set; } = new(); // 最近一轮安全审查结果
     public Dictionary<string, int> DegradeMap { get; set; } = []; // 节点进连续劣化轮数
 
 
@@ -1981,6 +2164,18 @@ public class KeeperNode
     public string QualityKey { get; set; } = string.Empty;
     public string Host { get; set; } = string.Empty;
     public int Port { get; set; }
+    public string Source { get; set; } = string.Empty;   // 来源池（owner/repo 短名）
+    public string Security { get; set; } = string.Empty; // 安全等级：高 / 中
+}
+
+[Serializable]
+public class KeeperSecurityAudit
+{
+    public string At { get; set; } = string.Empty;
+    public int Candidates { get; set; }
+    public int Rejected { get; set; }
+    public int Evicted { get; set; }
+    public string Reasons { get; set; } = string.Empty;
 }
 
 public sealed class KeeperQuality

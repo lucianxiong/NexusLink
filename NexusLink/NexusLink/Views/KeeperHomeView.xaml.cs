@@ -94,6 +94,8 @@ public partial class KeeperHomeView
                 return new
                 {
                     node.Remarks, node.Host, node.Port,
+                    Source = node.Source.Length > 0 ? node.Source : "—",
+                    Security = node.Security.Length > 0 ? node.Security : "—",
                     LatencyMs = latest > 0 ? latest : null,
                     SuccessRate = quality is { Samples.Count: > 0 }
                         ? (double?)quality.Samples.Count(sample => sample > 0) / quality.Samples.Count : null,
@@ -101,9 +103,13 @@ public partial class KeeperHomeView
                 };
             }).ToList();
         Nodes.ItemsSource = rows;
+        var audit = _keeper.State.SecurityAudit;
+        var auditLine = audit != null && audit.At.Length > 0
+            ? $" · 最近审查 {audit.At}：候选 {audit.Candidates}，拦截 {audit.Rejected} 个不安全节点" + (audit.Evicted > 0 ? $"，出池 {audit.Evicted} 个" : string.Empty)
+            : string.Empty;
         NodeSummary.Text = backup && pool.Count == 0 && _keeper.State.BackupCount > 0
-            ? $"已有 {_keeper.State.BackupCount} 个备用节点，刷新后显示明细"
-            : $"显示 {rows.Count} / {pool.Count} 个节点";
+            ? $"已有 {_keeper.State.BackupCount} 个备用节点，刷新后显示明细" + auditLine
+            : $"显示 {rows.Count} / {pool.Count} 个节点" + auditLine;
     }
 
     private void UpdateStatus()

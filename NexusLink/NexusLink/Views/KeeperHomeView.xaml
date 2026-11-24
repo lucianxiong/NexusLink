@@ -68,6 +68,8 @@
                         <DataGridTextColumn Header="节点" Binding="{Binding Remarks}" Width="2*"/>
                         <DataGridTextColumn Header="地址" Binding="{Binding Host}" Width="*"/>
                         <DataGridTextColumn Header="端口" Binding="{Binding Port}" Width="65"/>
+                        <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="150"/>
+                        <DataGridTextColumn Header="安全" Binding="{Binding Security}" Width="60"/>
                         <DataGridTextColumn Header="延迟" Binding="{Binding LatencyMs, TargetNullValue=—, StringFormat={}{0} ms}" Width="85"/>
                         <DataGridTextColumn Header="检测通过率" Binding="{Binding SuccessRate, TargetNullValue=—, StringFormat={}{0:P0}}" Width="100"/>
                         <DataGridTextColumn Header="最近检测" Binding="{Binding TestedAt, TargetNullValue=—, StringFormat={}{0:MM-dd HH:mm}}" Width="110"/>

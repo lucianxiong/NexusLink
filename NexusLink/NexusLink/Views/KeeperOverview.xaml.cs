@@ -166,7 +166,7 @@ public partial class KeeperOverview
         BtnConnect.Style = (Style)FindResource(sysOn ? "BtnAccent" : "BtnPrimary");
         CountBadge.Text = $"{st.Nodes.Count} 主池 / {st.BackupCount} 备用";
         LastRefreshText.Text = st.LastRefresh.Length > 0 ? $"上次更新 {st.LastRefresh}" : "";
-        var nodes = st.Nodes.Select(t => t.Remarks).ToList();
+        var nodes = st.Nodes.Select(NodeRow).ToList();
         if (!nodes.SequenceEqual(_nodeCache))
         {
             _nodeCache = nodes;
@@ -185,6 +185,21 @@ public partial class KeeperOverview
         }
 
         _uiLock = false;
+    }
+
+    // 线路列表行：节点名 + 来源 · 安全等级（标注随每轮审查刷新）
+    private static string NodeRow(KeeperNode t)
+    {
+        var meta = new List<string>();
+        if (t.Source.Length > 0)
+        {
+            meta.Add($"来源 {t.Source}");
+        }
+        if (t.Security.Length > 0)
+        {
+            meta.Add($"安全 {t.Security}");
+        }
+        return meta.Count > 0 ? $"{t.Remarks}    {string.Join(" · ", meta)}" : t.Remarks;
     }
 }
 
