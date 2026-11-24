@@ -112,10 +112,11 @@ public partial class KeeperOverview
         {
             SetDot(_green, 0.55);
             HeroTitle.Text = "已连接";
+            // 路线行只显示应用自己检测到的出口（国旗 国家 城市），不显示节点池写的名称或内核内部标签
             var place = $"{st.ExitCountry} {st.ExitCity}".Trim();
-            HeroRoute.Text = string.IsNullOrEmpty(st.ExitNode)
-                ? (place.Length > 0 ? place : "已连接（线路信息加载中…）")
-                : $"{place} · {st.ExitNode}";
+            HeroRoute.Text = place.Length > 0
+            ? (KeeperService.FlagOf(st.ExitCode) + " " + place).Trim()
+            : (st.ExitNode.Length > 0 ? st.ExitNode : "已连接");
             var meta = new List<string>();
             if (st.ExitIp.IsNotEmpty())
             {
@@ -139,7 +140,7 @@ public partial class KeeperOverview
         {
             SetDot(_orange, 0.3);
             HeroTitle.Text = "连接异常";
-            HeroRoute.Text = "系统代理已开，但线路不通 —— 可刷新并测试候选节点";
+            HeroRoute.Text = "线路不通，点「刷新与测速」";
             HeroMeta.Text = "";
             SetPill(DelayPill, DelayText, _gray, "延迟 --");
             SetPill(SpeedPill, SpeedText, _gray, "网速 --");
@@ -148,14 +149,14 @@ public partial class KeeperOverview
         {
             SetDot(_gray, 0);
             HeroTitle.Text = "未连接";
-            HeroRoute.Text = "浏览器当前直连（不走任何节点）—— 点下面按钮一键连上";
+            HeroRoute.Text = "点击连接";
             HeroMeta.Text = "";
             SetPill(DelayPill, DelayText, _gray, "延迟 --");
             SetPill(SpeedPill, SpeedText, _gray, "网速 --");
         }
 
         // ---- 连接按钮 ----
-        BtnConnect.Content = sysOn ? "断开连接（恢复直连）" : "立即连接";
+        BtnConnect.Content = sysOn ? "断开连接" : "立即连接";
 
         // ---- 开关 ----
         TbAutoSwitch.IsChecked = st.AutoSwitch;
@@ -187,19 +188,32 @@ public partial class KeeperOverview
         _uiLock = false;
     }
 
-    // 线路列表行：节点名 + 来源 · 安全等级（标注随每轮审查刷新）
+    // 线路列表行：检测出来的名称（实测出口 + 协议）+ 使用中/当前线路 · 机房/家宽 · 实测速度 · 安全 · 稳定等级 · 来源（标注随每轮换血刷新）
     private static string NodeRow(KeeperNode t)
     {
         var meta = new List<string>();
-        if (t.Source.Length > 0)
+        if (t.IndexId.Length > 0 && t.IndexId == KeeperService.Instance.State.ActiveIndexId)
         {
-            meta.Add($"来源 {t.Source}");
+            meta.Add(KeeperService.Instance.IsConnected ? "使用中" : "当前线路");
+        }
+        if (t.NetType.Length > 0)
+        {
+        meta.Add(t.NetType);
+        }
+        if (t.Exit.Length > 0 && t.Speed.Length > 0)
+        {
+        meta.Add(t.Speed);
         }
         if (t.Security.Length > 0)
         {
             meta.Add($"安全 {t.Security}");
         }
-        return meta.Count > 0 ? $"{t.Remarks}    {string.Join(" · ", meta)}" : t.Remarks;
+        meta.Add("稳定 " + (t.Stability.Length > 0 ? t.Stability : "—"));
+        if (t.Source.Length > 0)
+        {
+            meta.Add($"来源 {t.Source}");
+        }
+        return $"{t.Name}    {string.Join(" · ", meta)}";
     }
 }
 

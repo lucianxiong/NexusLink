@@ -78,6 +78,17 @@ public partial class CoreConfigSingboxService
                 }
                 tunInbound.route_exclude_address = _config.TunModeItem.RouteExcludeAddress;
 
+                // Windows：用两条 /1 路由接管全部流量。它们比物理网卡的 /0 默认路由更具体，一定优先，不依赖网卡 metric；
+                // 实测物理网卡 metric=0 与 TUN 持平时，Windows 会把一部分目标（GitHub、Cloudflare 等）仍送去直连。
+                if (context.IsWindows && tunInbound.auto_route == true)
+                {
+                    tunInbound.route_address = ["0.0.0.0/1", "128.0.0.0/1"];
+                    if (_config.TunModeItem.EnableIPv6Address == true)
+                    {
+                        tunInbound.route_address.AddRange(["::/1", "8000::/1"]);
+                    }
+                }
+
                 _coreConfig.inbounds.Add(tunInbound);
             }
         }

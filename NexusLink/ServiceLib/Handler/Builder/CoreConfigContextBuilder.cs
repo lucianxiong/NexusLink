@@ -51,7 +51,8 @@ public class CoreConfigContextBuilder
             IsMacOS = Utils.IsMacOS(),
             IsLinux = Utils.IsLinux(),
             HasGlobalIPv6Address = Utils.HasGlobalIPv6Address(),
-            ProtectCoreTypeList = config.TunModeItem.EnableTun ? [ECoreType.Xray, ECoreType.sing_box] : []
+            // TUN 下测速引擎 mihomo 必须直连：它连候选节点时若再经当前节点中转，延迟会被叠加、结果失真
+            ProtectCoreTypeList = config.TunModeItem.EnableTun ? [ECoreType.sing_box, ECoreType.mihomo] : []
         };
         var validatorResult = NodeValidatorResult.Empty();
         var (actNode, nodeValidatorResult) = await ResolveNodeAsync(context, node);

@@ -2,8 +2,14 @@
   "servers": [
     {
       "tag": "remote",
-      "type": "tcp",
+      "type": "https",
       "server": "8.8.8.8",
+      "server_port": 443,
+      "path": "/dns-query",
+      "tls": {
+        "enabled": true,
+        "server_name": "dns.google"
+      },
       "detour": "proxy"
     },
     {

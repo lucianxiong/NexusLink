@@ -16,7 +16,7 @@ namespace ServiceLib.Services;
 ///   分层结果落盘为 quality.yaml / backup.yaml（仅留档，mihomo 兜底接管已移除）。
 ///   Top3 高质量节点导入畅连主池（sing-box 原生策略组）。
 /// 守卫 = 启动防抖（核心就绪+宽限期内不判定）+ 滑动窗口迟滞（连续 N 次 bad 才动作）+
-///   池内补位（Topup：切换到池内最快节点，不全量换血）+
+///   池内换线（按 安全 > 稳定 > 带宽 > 延迟 重选，支持手动指定，不全量换血）+
 ///   告警（备用池也全垃圾时保留现有连接并告警）。
 /// </summary>
 public sealed class KeeperService
@@ -32,6 +32,7 @@ public sealed class KeeperService
     private Func<Task>? _reloadFunc;
     private Timer? _timer;
     private Timer? _statusTimer;
+    private static Process? _testProc; // 当前在跑的测速引擎（只在换血期间存在）
     private CancellationTokenSource? _wsCts;
     private long _upSpeed;
     private long _downSpeed;
@@ -81,11 +82,17 @@ public sealed class KeeperService
     public KeeperState State { get; private set; } = new();
 
     public bool IsRunning => Volatile.Read(ref _running) == 1;
+
+    // 已连接 = 用户开了「连接」（系统代理指向畅连）。TUN 只是连接方式（模式），不是开关：未连接时内核不运行，TUN 也不生效
+    public bool IsConnected => _config != null
+        && _config.SystemProxyItem.SysProxyType == ESysProxyType.ForcedChange;
     public double UpSpeed => Interlocked.Read(ref _upSpeed);
     public double DownSpeed => Interlocked.Read(ref _downSpeed);
 
     private KeeperService()
     {
+        // 状态在构造时就读进来：界面初始化期间任何设置项的保存都不能在空白状态上进行
+        LoadState();
         _httpDirect = new HttpClient(new HttpClientHandler
         {
             AutomaticDecompression = DecompressionMethods.All,
@@ -111,6 +118,7 @@ public sealed class KeeperService
         _reloadFunc = reloadFunc;
         LoadState();
         await EnsureGroupAsync();
+        await ReconcileNodesFromDbAsync();
         _timer = new Timer(async _ => await TimerTickAsync(), null, TimeSpan.FromSeconds(20), TimeSpan.FromMinutes(5));
         _statusTimer = new Timer(async _ => await PollStatusAsync(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(30));
         _lastRefreshAt = DateTime.TryParse(State.LastRefresh, out var lr) ? lr : DateTime.Now;
@@ -129,6 +137,83 @@ public sealed class KeeperService
             }
         }
         Logging.SaveLog($"KeeperService started (grace={State.StartupGraceSec}s guardN={State.GuardConsecutive} guardLat={State.GuardLatencyMs}ms)");
+    }
+
+    // 状态里的节点列表是数据库的缓存视图：启动时以数据库为准校准（数据库有节点而状态为空 ⇒ 状态文件曾丢失）
+    private async Task ReconcileNodesFromDbAsync()
+    {
+        try
+        {
+            var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
+            if (items.Count > 0)
+            {
+                var wasEmpty = State.Nodes.Count == 0;
+                var stale = State.Nodes.Count != items.Count || State.Nodes.Any(node => node.SecurityReason.IsNullOrEmpty());
+                State.Nodes = BuildNodes(items);
+                if (stale)
+                {
+                    SaveState();
+                    Logging.SaveLog($"KeeperService: node list rebuilt from database (db={items.Count}{(wasEmpty ? ", state file was empty" : string.Empty)})");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService reconcile nodes", ex);
+        }
+    }
+
+    // 启动接管：激活项是单个池内节点（托盘/服务器列表里手选过）时，转成「手动指定」并把激活项切回策略组——
+    // 线路不变，选路机制与失效兜底随之生效；管家之外的自建节点保持原样，不替用户改线路。
+    private async Task AdoptManualSelectionAsync()
+    {
+        try
+        {
+            if (_config == null || !State.Enabled || _config.IndexId == GroupIndexId)
+            {
+                return;
+            }
+            var chosen = _config.IndexId;
+            var pool = await AppManager.Instance.ProfileItems(SubId) ?? [];
+            if (chosen.IsNullOrEmpty() || pool.All(t => t.IndexId != chosen))
+            {
+                Logging.SaveLog("KeeperService: active server is outside the keeper pool — leaving it untouched, selection paused");
+                return;
+            }
+            State.PinnedIndexId = chosen;
+            State.PinnedRemarks = (await AppManager.Instance.GetProfileItem(chosen))?.Remarks ?? string.Empty;
+            await ConfigHandler.SetDefaultServerIndex(_config, GroupIndexId);
+            SaveState();
+            if (_reloadFunc != null)
+            {
+                await _reloadFunc();
+            }
+            Logging.SaveLog($"KeeperService: manual selection '{State.PinnedRemarks}' adopted as pinned node; active server restored to policy group");
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService adopt manual selection", ex);
+        }
+    }
+
+    // 池内复审：老版本放进来的、链接被改过的、名称或出口不合规（国内 / 港澳台 / 日抛）的节点一律出池。
+    // 与本轮换血结果无关——新节点一个都没达标时也必须跑，否则不合规的旧节点会一直留在池里被选中。
+    private async Task<int> AuditExistingPoolAsync()
+    {
+        var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
+        var bad = items.Where(t => !t.IsValid() || t.GetAllowInsecure() || !SecurityAllows(t) || IsNonOverseasExit(t)
+                || NameRejection(t.Remarks) != null).ToList();
+        if (bad.Count == 0)
+        {
+            return 0;
+        }
+        foreach (var evicted in bad)
+        {
+            Logging.SaveLog($"KeeperService security audit: evicted '{evicted.Remarks}' ({(IsNonOverseasExit(evicted) ? "出口在中国大陆/港澳台" : NameRejection(evicted.Remarks) ?? EvaluateSecurity(evicted).Reason)})");
+        }
+        State.SecurityAudit.Evicted = bad.Count;
+        await ConfigHandler.RemoveServers(_config, bad);
+        return bad.Count;
     }
 
     private async Task TimerTickAsync()
@@ -195,11 +280,19 @@ public sealed class KeeperService
             _config.SystemProxyItem.SysProxyType = ESysProxyType.Unchanged;
             State.Online = false;
             await ConfigHandler.SaveConfig(_config);
+            await SyncCoreWithConnectionAsync(false);
             NoticeManager.Instance.SendMessage("畅连已让出系统代理");
             return;
         }
         try
         {
+            // 兜底：不在连接状态时内核不留在后台（启动时未连接、系统代理被其他应用接管等情况）
+            if (_config != null && CoreManager.Instance.IsRunning
+                && !CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+            {
+                await SyncCoreWithConnectionAsync(false);
+                return;
+            }
             var port = AppManager.Instance.StatePort2;
             var json = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{port}/proxies");
             _coreApiOk = true;
@@ -225,9 +318,10 @@ public sealed class KeeperService
                 }
             }
 
-            State.ExitNode = node;
+            State.ExitNode = DisplayNameOfClashName(node);
             State.LatencyMs = delay;
-            State.ExitIp = State.ExitCountry = State.ExitCity = State.ExitIsp = string.Empty;
+            State.ExitIp = State.ExitCountry = State.ExitCity = State.ExitIsp = State.ExitCode = string.Empty;
+            FillExitInfo(node);
             State.PollAt = DateTime.Now.ToString("HH:mm:ss");
         }
 
@@ -240,10 +334,20 @@ public sealed class KeeperService
         }
 
         State.Online = await VerifyProxyAsync();
+        if (!_adoptionDone)
+        {
+            _adoptionDone = true;
+            await AdoptManualSelectionAsync(); // 把手选的单节点转成手动指定并切回策略组
+        }
+        await ApplySelectionAsync(); // 核对内核选择器是否仍指向策略目标（内核重载后会复位）
         State.PollAt = DateTime.Now.ToString("HH:mm:ss");
         if ((DateTime.Now - _startedAt).TotalSeconds >= State.StartupGraceSec)
         {
-            EnqueueProbe(State.Online, State.LatencyMs);
+            // 断开期间的探测不进守卫窗口（内核已停，探测必然失败，不代表线路有问题）
+            if (_config?.SystemProxyItem.SysProxyType == ESysProxyType.ForcedChange)
+            {
+                EnqueueProbe(State.Online, State.LatencyMs);
+            }
             await AutoGuardAsync();
         }
     }
@@ -277,7 +381,7 @@ public sealed class KeeperService
     {
         try
         {
-            if (!State.Enabled || !State.AutoSwitch || IsRunning || _config?.SystemProxyItem.SysProxyType != ESysProxyType.ForcedChange)
+            if (!State.Enabled || (!State.AutoSwitch && State.PinnedIndexId.IsNullOrEmpty()) || _config?.IndexId != GroupIndexId || IsRunning || _config?.SystemProxyItem.SysProxyType != ESysProxyType.ForcedChange)
             {
                 return;
             }
@@ -300,13 +404,16 @@ public sealed class KeeperService
             var lastLat = window[^1].latency;
             Logging.SaveLog($"KeeperService guard: {State.GuardConsecutive} consecutive bad probes (latency={lastLat}ms) → action");
 
-            // 1) 池内补位：有 clash API 就按真测速结果切；xray 没有 clash API，改按 TCP 时延挑一条换上去
+            // 1) 池内换线：有 clash API 就按选路策略（安全 > 稳定 > 带宽 > 延迟）排除当前故障节点后重选；
+            //    xray 没有 clash API，改按 TCP 时延挑一条换上去
             var switched = _coreApiOk
-                ? await TopupFromPoolAsync()
+                ? await ApplySelectionAsync(force: true, excludeTag: _selectorNow)
                 : await SwitchToBestPoolNodeAsync();
             if (switched)
             {
-                NoticeManager.Instance.SendMessage("畅连管家：线路质量连续劣化，已切到池内最快节点（未换血）");
+                NoticeManager.Instance.SendMessage(_coreApiOk
+                    ? $"畅连管家：线路质量连续劣化，已切换（{State.SelectMode}，未换血）"
+                    : "畅连管家：线路质量连续劣化，已切到池内可达节点（未换血）");
                 return;
             }
 
@@ -376,83 +483,383 @@ public sealed class KeeperService
         return false;
     }
 
-    // 池内补位：经 clash API 对策略组成员真测速，切到 delay 最小且 < GuardLatencyMs 的节点
-    private async Task<bool> TopupFromPoolAsync()
+    // ------------------------------------------------------------------ 选路：安全 > 稳定 > 带宽 > 延迟（手动指定优先）
+    // 内核里的 proxy 选择器默认指向 proxy-auto（内核自己的延迟测速）。管家用 clash API 把它指到按策略选出的节点，
+    // 不重启内核；内核不保存选择结果，所以每次状态轮询都会核对一遍，内核重载后自动重新应用。
+    private string _selectorNow = string.Empty;     // 内核 proxy 选择器当前指向（proxy-auto 或 proxy-N-备注）
+    private string _selectorWanted = string.Empty;  // 最近一次成功下发给内核的目标
+    private DateTime _lastGroupTestAt = DateTime.MinValue;
+    private bool _adoptionDone;                     // 首次轮询时把用户手选的单节点转成手动指定（只做一次）
+    private const int ExitProbeMax = 16;            // 每轮换血最多查询这么多个节点的出口归属
+    private const int SpeedProbeMax = 10;            // 其中前这么多个顺带实测下行带宽
+    private const int SpeedProbeSeconds = 5;         // 单个节点带宽实测的最长时间
+    private const string SpeedProbeUrl = "https://speed.cloudflare.com/__down?bytes=50000000";
+
+    // 主池延迟上限：不高于隔离门槛，也不高于用户设置的 MaxLatencyMs
+    private int MainLatencyLimit => Math.Min(State.QuarantineMaxLatencyMs, Math.Clamp(State.MaxLatencyMs, 200, 3000));
+
+    // 非海外出口 = 中国大陆及港澳台（规则：节点只能是海外安全节点）
+    private static readonly HashSet<string> NonOverseasCodes = new(StringComparer.OrdinalIgnoreCase) { "CN", "HK", "MO", "TW" };
+
+    private bool IsNonOverseasExit(ProfileItem item)
+        => State.Exits.TryGetValue(GetQualityKey(item), out var exitInfo) && NonOverseasCodes.Contains(exitInfo.CountryCode);
+
+    private int AliveDaysOf(ProfileItem item)
+    {
+        return State.QualityHistory.TryGetValue(GetQualityKey(item), out var quality) && quality.FirstSeen != default
+            ? Math.Max(0, (int)(DateTime.Now - quality.FirstSeen).TotalDays)
+            : -1;
+    }
+
+    public void SetMaxLatency(int ms)
+    {
+        State.MaxLatencyMs = Math.Clamp(ms, 200, 3000);
+        SaveState();
+    }
+
+    // 手动切换：固定用某个节点；节点失效或离开池子后自动回到自动选路
+    public async Task<bool> PinNodeAsync(string indexId)
+    {
+        if (_config == null || indexId.IsNullOrEmpty())
+        {
+            return false;
+        }
+        try
+        {
+            if (_config.IndexId != GroupIndexId)
+            {
+                // 手动切换依赖策略组选择器：先切回「畅连·自动优选」组（会重载一次内核）
+                await ConfigHandler.SetDefaultServerIndex(_config, GroupIndexId);
+                if (_reloadFunc != null)
+                {
+                    await _reloadFunc();
+                }
+            }
+            State.PinnedIndexId = indexId;
+            State.PinnedRemarks = (await AppManager.Instance.GetProfileItem(indexId))?.Remarks ?? string.Empty;
+            SaveState();
+            for (var attempt = 0; attempt < 5; attempt++)
+            {
+                if (await ApplySelectionAsync(force: true))
+                {
+                    Logging.SaveLog($"KeeperService: manual pin → '{State.PinnedRemarks}' applied");
+                    return true;
+                }
+                await Task.Delay(1000);
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService pin", ex);
+            return false;
+        }
+    }
+
+    // 恢复自动：解除手动指定，交还给 安全 > 稳定 > 带宽 > 延迟 的自动选路
+    public async Task<bool> UnpinAsync()
+    {
+        State.PinnedIndexId = State.PinnedRemarks = string.Empty;
+        SaveState();
+        return await ApplySelectionAsync(force: true);
+    }
+
+    /// 把手动指定 / 自动优选落到内核选择器上（不重启内核）。
+    /// 返回 true = 选择器已指向策略目标，且该目标不是 excludeTag。
+    private async Task<bool> ApplySelectionAsync(bool force = false, string? excludeTag = null)
     {
         try
         {
-            if (_config == null)
+            if (_config == null || _config.IndexId != GroupIndexId || !_coreApiOk)
             {
                 return false;
             }
-            var port = AppManager.Instance.StatePort2;
-            var testUrl = Uri.EscapeDataString(TestUrl);
-            Dictionary<string, int> delays = [];
-            try
-            {
-                var json = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{port}/group/proxy/delay?url={testUrl}&timeout=5000");
-                delays = ParseDelayMap(json);
-            }
-            catch
-            {
-                // 回退：逐节点并行测
-                var listJson = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{port}/proxies/proxy");
-                var members = JsonUtils.ParseJson(listJson)?["proxies"]?["proxy"]?["all"] as JsonArray;
-                if (members == null || members.Count == 0)
-                {
-                    return false;
-                }
-                var sem = new SemaphoreSlim(4);
-                var bag = new ConcurrentBag<KeyValuePair<string, int>>();
-                var tasks = members.OfType<JsonValue>().Select(async mv =>
-                {
-                    await sem.WaitAsync();
-                    try
-                    {
-                        var name = Uri.EscapeDataString(mv.GetValue<string>());
-                        var r = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{port}/proxies/{name}/delay?url={testUrl}&timeout=5000");
-                        var d = JsonUtils.ParseJson(r)?["delay"]?.GetValue<int>();
-                        if (d != null)
-                        {
-                            bag.Add(new(mv.GetValue<string>(), d.Value));
-                        }
-                    }
-                    catch { }
-                    finally
-                    {
-                        sem.Release();
-                    }
-                });
-                await Task.WhenAll(tasks);
-                delays = bag.ToDictionary(kv => kv.Key, kv => kv.Value);
-            }
-
-            var best = delays.Where(kv => kv.Value > 0 && kv.Value < State.GuardLatencyMs).OrderBy(kv => kv.Value).FirstOrDefault();
-            if (best.Key == null || best.Value == default)
-            {
-                Logging.SaveLog($"KeeperService topup: no alive member under {State.GuardLatencyMs}ms (checked {delays.Count})");
-                return false;
-            }
-
+            var api = $"http://{Global.Loopback}:{AppManager.Instance.StatePort2}";
             var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
-            var idx = MatchIndexId(best.Key, items);
-            if (idx.IsNullOrEmpty())
-            {
-                Logging.SaveLog($"KeeperService topup: cannot map clash node '{best.Key}' to ProfileItem");
-                return false;
-            }
-            if (!await SwitchAndVerifyAsync(idx))
+            var proxies = await FetchProxiesAsync(api);
+            var members = MemberTags(proxies);
+            if (members.Count == 0)
             {
                 return false;
             }
-            Logging.SaveLog($"KeeperService topup: switched to '{best.Key}' ({best.Value}ms)");
+            // 刚重载内核还没有测速数据、或守卫强制重选时：先让内核对全组成员做一轮真测速
+            if ((force || MembersUntested(proxies, members)) && (DateTime.Now - _lastGroupTestAt).TotalSeconds >= 60)
+            {
+                _lastGroupTestAt = DateTime.Now;
+                try
+                {
+                    await _httpDirect.GetStringAsync($"{api}/group/proxy-auto/delay?url={Uri.EscapeDataString(TestUrl)}&timeout=5000");
+                    proxies = await FetchProxiesAsync(api);
+                    members = MemberTags(proxies);
+                    if (members.Count == 0)
+                    {
+                        return false;
+                    }
+                }
+                catch { }
+            }
+
+            // 内核最近一次测速结果缓存给界面（每次轮询同步；比换血时的历史样例新）
+            var kernelDelays = new Dictionary<string, int>();
+            var kernelTimes = new Dictionary<string, string>();
+            foreach (var memberTag in members)
+            {
+                var memberId = MatchIndexId(memberTag, items);
+                if (memberId.IsNotEmpty())
+                {
+                    kernelDelays[memberId] = int.Parse(LatestDelay(proxies, memberTag));
+                    kernelTimes[memberId] = LatestDelayTime(proxies, memberTag);
+                }
+            }
+            State.KernelDelays = kernelDelays;
+            State.KernelDelayTimes = kernelTimes;
+
+            var now = proxies["proxy"]?["now"]?.GetValue<string>() ?? string.Empty;
+            _selectorNow = now;
+            // 实际在用的节点：选择器指向 proxy-auto（内核自带测速）时，再看 urltest 组当前选中的是谁
+            var effective = now == "proxy-auto" ? proxies["proxy-auto"]?["now"]?.GetValue<string>() ?? string.Empty : now;
+            State.ActiveIndexId = MatchIndexId(effective, items);
+
+            string? wanted = null;
+            var mode = string.Empty;
+            if (State.PinnedIndexId.IsNotEmpty())
+            {
+                var pinTag = members.FirstOrDefault(tag => MatchIndexId(tag, items) == State.PinnedIndexId);
+                if (pinTag == null || (force && now == pinTag && excludeTag == pinTag))
+                {
+                    // 指定节点已离开池子，或被守卫判定故障 → 回到自动选路
+                    Logging.SaveLog($"KeeperService: pinned node '{State.PinnedRemarks}' {(pinTag == null ? "left the pool" : "is failing")}; back to auto selection");
+                    NoticeManager.Instance.SendMessage("畅连管家：手动指定的节点已失效，已回到自动选路");
+                    State.PinnedIndexId = State.PinnedRemarks = string.Empty;
+                    SaveState();
+                }
+                else
+                {
+                    wanted = pinTag;
+                    mode = "手动 · " + NodeDisplayName(State.PinnedIndexId, State.PinnedRemarks);
+                }
+            }
+            if (wanted == null)
+            {
+                if (!State.AutoSwitch)
+                {
+                    return false; // 用户关闭了自动切换且没有手动指定：不替用户选
+                }
+                wanted = PickAuto(proxies, members, items, now, excludeTag) ?? "proxy-auto";
+                mode = wanted == "proxy-auto" ? "自动 · 内核测速" : "自动 · " + NodeDisplayName(MatchIndexId(wanted, items), TagToRemarks(wanted));
+            }
+            State.SelectMode = mode;
+            if (now == wanted)
+            {
+                _selectorWanted = wanted;
+                return wanted != excludeTag;
+            }
+            using var put = new HttpRequestMessage(HttpMethod.Put, $"{api}/proxies/proxy");
+            put.Content = new StringContent(JsonSerializer.Serialize(new { name = wanted }), Encoding.UTF8, "application/json");
+            using var response = await _httpDirect.SendAsync(put);
+            if (!response.IsSuccessStatusCode)
+            {
+                return false;
+            }
+            _selectorNow = _selectorWanted = wanted;
+            State.ActiveIndexId = MatchIndexId(wanted == "proxy-auto" ? proxies["proxy-auto"]?["now"]?.GetValue<string>() ?? string.Empty : wanted, items);
+            Logging.SaveLog($"KeeperService: selector → '{wanted}' ({mode})");
             return true;
         }
         catch (Exception ex)
         {
-            Logging.SaveLog("KeeperService topup", ex);
+            Logging.SaveLog("KeeperService select", ex);
             return false;
         }
+    }
+
+    private async Task<JsonNode> FetchProxiesAsync(string api)
+        => JsonUtils.ParseJson(await _httpDirect.GetStringAsync($"{api}/proxies"))?["proxies"] ?? new JsonObject();
+
+    private static List<string> MemberTags(JsonNode proxies)
+    {
+        var all = proxies["proxy"]?["all"] as JsonArray;
+        return all == null ? [] : all.OfType<JsonValue>().Select(v => v.GetValue<string>()).ToList();
+    }
+
+    private static bool MembersUntested(JsonNode proxies, List<string> members)
+        => members.Where(tag => tag != "proxy-auto").All(tag => proxies[tag]?["history"] is not JsonArray { Count: > 0 });
+
+    private static string LatestDelay(JsonNode proxies, string tag)
+    {
+        var history = proxies[tag]?["history"] as JsonArray;
+        return history is { Count: > 0 } ? history[history.Count - 1]?["delay"]?.GetValue<int>().ToString() ?? "0" : "0";
+    }
+
+    private static string LatestDelayTime(JsonNode proxies, string tag)
+    {
+        var history = proxies[tag]?["history"] as JsonArray;
+        var time = history is { Count: > 0 } ? history[history.Count - 1]?["time"]?.GetValue<string>() : null;
+        return DateTime.TryParse(time, out var at) ? at.ToString("HH:mm:ss") : string.Empty;
+    }
+
+    private static string TagToRemarks(string tag) => System.Text.RegularExpressions.Regex.Replace(tag, @"^proxy-\d+-", string.Empty);
+
+    // 自动优选：收集池内节点的 安全等级 / 稳定天数 / 带宽 / 最近测速延迟，交给 RankAuto 排序
+    private string? PickAuto(JsonNode proxies, List<string> members, List<ProfileItem> items, string now, string? excludeTag)
+    {
+        var rows = new List<(string Tag, int Security, int Days, int Speed, int Delay)>();
+        foreach (var tag in members)
+        {
+            if (tag == "proxy-auto")
+            {
+                continue;
+            }
+            var item = items.FirstOrDefault(t => t.IndexId == MatchIndexId(tag, items));
+            // 不在池里、名称不合规（国内 / 港澳台 / 日抛）、安全不达标、或实测出口在大陆/港澳台的节点，不参与自动选路
+            if (item == null || NameRejection(item.Remarks) != null || !SecurityAllows(item) || IsNonOverseasExit(item))
+            {
+                continue;
+            }
+            var exit = State.Exits.GetValueOrDefault(GetQualityKey(item));
+            // 安全分：等级高的优先；同级里「已知代理出口」排后（AI 服务常拦这类 IP）
+            var security = SecurityRank(EvaluateSecurity(item).Level) * 2 + (exit?.Proxy == true ? 0 : 1);
+            rows.Add((tag, security, AliveDaysOf(item), SpeedTier(exit?.DownKBs ?? 0), int.Parse(LatestDelay(proxies, tag))));
+        }
+        return RankAuto(rows.ToArray(), now, excludeTag, MainLatencyLimit);
+    }
+
+    // 纯排序规则：安全 > 稳定天数 > 带宽 > 延迟。
+    // 在用节点只要还能用、不超延迟上限、安全不低于最优、带宽不吃亏，就保持不动 —— 看视频、用 AI 服务最怕出口来回跳。
+    // 全池都超上限时（没有更好的可选），在用节点只要不明显差于最优（延迟 ≤ 最优的 1.3 倍）同样保持，避免毫秒级波动来回切。
+    // 没有任何测速数据时交给内核自带测速（proxy-auto）。
+    internal static string? RankAuto((string Tag, int Security, int Days, int Speed, int Delay)[] rows, string now, string? excludeTag, int maxLatency)
+    {
+        var fallback = excludeTag == "proxy-auto" ? null : "proxy-auto";
+        if (rows.Length == 0 || rows.All(r => r.Delay <= 0))
+        {
+            return fallback;
+        }
+        var best = rows.Where(r => r.Delay > 0 && r.Tag != excludeTag)
+            .OrderByDescending(r => r.Security).ThenByDescending(r => r.Days).ThenByDescending(r => r.Speed).ThenBy(r => r.Delay).FirstOrDefault();
+        if (best.Tag == null)
+        {
+            return fallback;
+        }
+        var current = rows.FirstOrDefault(r => r.Tag == now);
+        if (current.Tag != null && current.Tag != excludeTag && current.Delay > 0
+            && current.Security == best.Security && current.Speed >= best.Speed
+            && (current.Delay <= maxLatency || (best.Delay > maxLatency && current.Delay <= best.Delay * 13 / 10)))
+        {
+            return current.Tag;
+        }
+        return best.Tag;
+    }
+
+    // ---------------------------------------------------------------- 出口归属与带宽标注
+    // 换血测速后，让 mihomo harness 的 PICK 组逐个指向候选节点，从该节点的出口查 ip-api（看到的就是这个节点的出口），
+    // 并经它下载测速文件实测下行带宽 —— 看视频、传大文件靠的是带宽，延迟低不代表跑得快。
+    private async Task<Dictionary<string, KeeperExit>> ProbeExitsAsync(Dictionary<string, int> testMap, List<(string link, Dictionary<string, object?> proxy)> parsed)
+    {
+        var result = new Dictionary<string, KeeperExit>();
+        var byName = parsed.ToDictionary(t => (string)t.proxy["name"]!, t => t);
+        // 先按安全等级、再按延迟排：安全的先查，前 SpeedProbeMax 个顺带实测带宽
+        var targets = testMap.Where(kv => kv.Value > 0 && byName.ContainsKey(kv.Key))
+            .OrderByDescending(kv => CandidateSecurity(byName[kv.Key].link))
+            .ThenBy(kv => kv.Value)
+            .Take(ExitProbeMax).ToList();
+        using var client = new HttpClient(new HttpClientHandler { Proxy = new WebProxy($"http://{Global.Loopback}:{TestPort}") })
+        {
+            Timeout = TimeSpan.FromSeconds(8),
+        };
+        for (var i = 0; i < targets.Count; i++)
+        {
+            var name = targets[i].Key;
+            RefreshStatus = $"正在查询出口归属与带宽 · {i + 1}/{targets.Count}";
+            try
+            {
+                using var put = new HttpRequestMessage(HttpMethod.Put, $"http://{Global.Loopback}:{TestApiPort}/proxies/PICK");
+                put.Content = new StringContent(JsonSerializer.Serialize(new { name }), Encoding.UTF8, "application/json");
+                if (!(await _httpDirect.SendAsync(put)).IsSuccessStatusCode)
+                {
+                    continue;
+                }
+                var exitInfo = ParseExitInfo(await client.GetStringAsync("http://ip-api.com/json?fields=status,country,countryCode,city,isp,org,hosting,proxy,query"));
+                if (exitInfo == null)
+                {
+                    continue;
+                }
+                if (i < SpeedProbeMax)
+                {
+                    exitInfo.DownKBs = await MeasureSpeedAsync(client);
+                }
+                result[name] = exitInfo;
+            }
+            catch { }
+        }
+        return result;
+    }
+
+    private static int CandidateSecurity(string link)
+        => FmtHandler.ResolveConfig(link, out _) is { } profile ? SecurityRank(EvaluateSecurity(profile).Level) : 0;
+
+    // 经节点下载 Cloudflare 测速文件，最多 SpeedProbeSeconds 秒，按实际收到的字节算下行速度（KB/s）；不通或太慢返回 0
+    private static async Task<double> MeasureSpeedAsync(HttpClient client)
+    {
+        long bytes = 0;
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(SpeedProbeSeconds));
+            using var response = await client.GetAsync(SpeedProbeUrl, HttpCompletionOption.ResponseHeadersRead, deadline.Token);
+            await using var stream = await response.Content.ReadAsStreamAsync(deadline.Token);
+            var buffer = new byte[65536];
+            while (true)
+            {
+                var read = await stream.ReadAsync(buffer, deadline.Token);
+                if (read <= 0)
+                {
+                    break;
+                }
+                bytes += read;
+            }
+        }
+        catch { }
+        var seconds = sw.ElapsedMilliseconds / 1000.0;
+        return seconds >= 0.5 ? bytes / 1024.0 / seconds : 0;
+    }
+
+    // 内核里的节点标签 → 界面显示名（实测出口 + 协议）；找不到对应节点时退回去掉序号前缀的原始名称
+    private string DisplayNameOfClashName(string clashName)
+    {
+        if (clashName.IsNullOrEmpty())
+        {
+            return string.Empty;
+        }
+        var hit = FindNodeByClashName(clashName);
+        return hit != null ? hit.Name : TagToRemarks(clashName);
+    }
+
+    // 内核标签形如 proxy-3-备注：按备注尾部匹配回池内节点
+    private KeeperNode? FindNodeByClashName(string clashName)
+        => State.Nodes.FirstOrDefault(t => clashName == t.Remarks || clashName.EndsWith(t.Remarks, StringComparison.Ordinal));
+
+    // 选路说明里显示的也是检测出来的名称；找不到节点时才退回原始备注
+    private string NodeDisplayName(string indexId, string fallback)
+        => State.Nodes.FirstOrDefault(t => t.IndexId.Length > 0 && t.IndexId == indexId)?.Name ?? fallback;
+
+    // 首页的出口 IP / 归属地直接取最近一次出口查询结果（按当前节点匹配），不再额外发请求
+    private void FillExitInfo(string clashName)
+    {
+        if (clashName.IsNullOrEmpty())
+        {
+            return;
+        }
+        var hit = FindNodeByClashName(clashName);
+        if (hit == null || !State.Exits.TryGetValue(hit.QualityKey, out var exitInfo))
+        {
+            return;
+        }
+        State.ExitIp = exitInfo.Ip;
+        State.ExitCountry = ZhCountry.GetValueOrDefault(exitInfo.CountryCode, exitInfo.Country);
+        State.ExitCity = exitInfo.City;
+        State.ExitIsp = exitInfo.Isp;
+        State.ExitCode = exitInfo.CountryCode;
     }
 
     // 池健康盘点（每 TopupIntervalHours）：全组真测速 → 连续劣化降级出池 → 缺员从质量备选库补位
@@ -567,6 +974,25 @@ public sealed class KeeperService
         ("芬兰", "FI"), ("FI", "FI"), ("澳大利亚", "AU"), ("AU", "AU"), ("马来", "MY"), ("MY", "MY"),
         ("泰国", "TH"), ("TH", "TH"), ("越南", "VN"), ("VN", "VN"), ("菲律宾", "PH"), ("PH", "PH"),
     ];
+
+    // 稳定评级（只用可核对的记录）：出现天数 + 最近实测通过率。记录不足 1 天的证明不了稳定，按「低」计。
+    internal static (string Level, string Reason) EvaluateStability(KeeperQuality? quality, DateTime now)
+    {
+        var days = quality is { FirstSeen.Ticks: > 0 } ? Math.Max(0, (int)(now - quality.FirstSeen).TotalDays) : 0;
+        var samples = quality?.Samples ?? [];
+        var tested = samples.Count;
+        var passed = samples.Count(sample => sample > 0);
+        var record = $"首次出现 {(days < 1 ? "不足 1 天" : days + " 天前")} · 最近 {tested} 次实测通过 {passed} 次";
+        if (tested >= 3 && days >= 3 && passed * 100 >= tested * 90)
+        {
+            return ("高", record);
+        }
+        if (tested >= 2 && days >= 1 && passed * 100 >= tested * 70)
+        {
+            return ("中", record);
+        }
+        return ("低", tested == 0 ? "尚无实测记录" : record);
+    }
 
     private static string RegionOf(string name)
     {
@@ -693,7 +1119,7 @@ public sealed class KeeperService
                 Rejected = rejectedTotal,
                 Reasons = rejectedSummary,
             };
-            Logging.SaveLog($"KeeperService security audit: poolsOk={poolsOk}/{poolUrls.Count} candidates={links.Count} rejectedBySecurity={rejectedTotal}{(rejectedTotal > 0 ? $" ({rejectedSummary})" : string.Empty)} minSecurity={State.MinSecurity}");
+            Logging.SaveLog($"KeeperService security audit: poolsOk={poolsOk}/{poolUrls.Count} candidates={links.Count} rejected={rejectedTotal}{(rejectedTotal > 0 ? $" ({rejectedSummary})" : string.Empty)} minSecurity={State.MinSecurity}");
             if (links.Count < State.MinAlive)
             {
                 Logging.SaveLog($"KeeperService refresh FAILED: poolsOk={poolsOk}/{State.Pools.Count} links={links.Count} (insufficient)");
@@ -777,13 +1203,15 @@ public sealed class KeeperService
                 $"    health-check: {hc60}",
                 "proxy-groups:",
                 $"  - {{name: TEST, type: url-test, use: [backup], url: '{TestUrl}', interval: 60, tolerance: 100, lazy: false}}",
+                "  - {name: PICK, type: select, use: [backup]}",
                 "rules:",
-                "  - MATCH,TEST",
+                "  - MATCH,PICK",
             });
             RefreshStatus = $"正在准备测速 · {parsed.Count} 个安全候选";
             await File.WriteAllTextAsync(Path.Combine(WorkDir, "config-test.yaml"), testCfg);
 
             var testProc = StartMihomo($"-d \"{WorkDir}\" -f config-test.yaml");
+            Interlocked.Exchange(ref _testProc, testProc);
             if (testProc == null)
             {
                 Logging.SaveLog("KeeperService refresh FAILED: mihomo harness cannot start");
@@ -791,6 +1219,7 @@ public sealed class KeeperService
                 return false;
             }
             Dictionary<string, int> testMap;
+            Dictionary<string, KeeperExit> exits;
             try
             {
                 var ready = false;
@@ -830,12 +1259,28 @@ public sealed class KeeperService
                     $"http://{Global.Loopback}:{TestApiPort}/group/TEST/delay?url={Uri.EscapeDataString(SecondaryTestUrl)}&timeout=5000"));
                 testMap = ParseDelayMap(delayJson)
                     .Where(pair => pair.Value > 0 && secondary.GetValueOrDefault(pair.Key) > 0)
-                    .ToDictionary(pair => pair.Key, pair => Math.Max(pair.Value, secondary[pair.Key]));
+                    .ToDictionary(pair => pair.Key, pair => pair.Value);
+                exits = await ProbeExitsAsync(testMap, parsed);
             }
             finally
             {
+                Interlocked.CompareExchange(ref _testProc, null, testProc);
                 KillProc(testProc);
             }
+            // 出口归属记到节点档案（按节点身份 QualityKey），30 天前的旧记录清掉
+            foreach (var (link, proxy) in parsed)
+            {
+                if (exits.TryGetValue((string)proxy["name"]!, out var exitInfo) && FmtHandler.ResolveConfig(link, out _) is { } exitProfile)
+                {
+                    State.Exits[GetQualityKey(exitProfile)] = exitInfo;
+                }
+            }
+            var exitCutoff = DateTime.Now.AddDays(-30);
+            foreach (var staleExit in State.Exits.Where(kv => DateTime.TryParse(kv.Value.At, out var at) && at < exitCutoff).Select(kv => kv.Key).ToList())
+            {
+                State.Exits.Remove(staleExit);
+            }
+            Logging.SaveLog($"KeeperService refresh: exits resolved={exits.Count}/{Math.Min(ExitProbeMax, testMap.Count(kv => kv.Value > 0))} latencyCap={MainLatencyLimit}ms");
             var testedAt = DateTime.Now;
             var qualityHistory = new Dictionary<string, KeeperQuality>(State.QualityHistory);
             foreach (var (link, proxy) in parsed)
@@ -852,15 +1297,26 @@ public sealed class KeeperService
                 {
                     Samples = samples.Append(measured).TakeLast(20).ToList(),
                     TestedAt = testedAt,
+                    FirstSeen = previous?.FirstSeen is { Ticks: > 0 } firstSeen ? firstSeen : testedAt, // 稳定天数从这里起算
                 };
+            }
+            // 池内已有节点补记首次出现时间（老数据没有这个字段，从现在起算）
+            foreach (var poolItem in await AppManager.Instance.ProfileItems(SubId) ?? [])
+            {
+                if (qualityHistory.TryGetValue(GetQualityKey(poolItem), out var poolQuality) && poolQuality.FirstSeen == default)
+                {
+                    poolQuality.FirstSeen = testedAt;
+                }
             }
             State.QualityHistory = qualityHistory
                 .Where(item => item.Value.TestedAt >= testedAt.AddDays(-30))
                 .ToDictionary();
             SaveState();
             var aliveForGoogle = testMap.Where(kv => kv.Value > 0).OrderBy(kv => kv.Value).ToList();
-            var quarantined = aliveForGoogle.Where(kv => kv.Value < State.QuarantineMaxLatencyMs).ToList();
-            Logging.SaveLog($"KeeperService refresh: tested={parsed.Count} dualTargetAlive={aliveForGoogle.Count} mainPoolPass={quarantined.Count}");
+            var quarantined = aliveForGoogle.Where(kv => kv.Value < MainLatencyLimit).ToList();
+            Logging.SaveLog($"KeeperService refresh: tested={parsed.Count} dualTargetAlive={aliveForGoogle.Count} mainPoolPass={quarantined.Count} latencyCap={MainLatencyLimit}ms overCap={aliveForGoogle.Count - quarantined.Count}");
+            var delaySample = string.Join("  ", aliveForGoogle.Take(8).Select(kv => $"{(kv.Key.Length > 18 ? kv.Key[..18] : kv.Key)}={kv.Value}ms"));
+            Logging.SaveLog($"KeeperService refresh: delays {delaySample}");
             if (aliveForGoogle.Count < 1)
             {
                 NoticeManager.Instance.SendMessage($"畅连管家：⚠️ 本轮 {parsed.Count} 个节点无一通过真测速（免费池高峰期常见），保留现有连接（告警）");
@@ -868,7 +1324,7 @@ public sealed class KeeperService
                 return false;
             }
 
-            // 4. 隔离晋升：真测速 <800ms 的进 quality.yaml（Primary-Pool 专用），其余活节点留 backup.yaml
+            // 4. 隔离晋升：实测延迟低于上限（MaxLatencyMs，默认 800ms）的进 quality.yaml（Primary-Pool 专用），其余活节点留 backup.yaml
             var qualityProxies = new List<Dictionary<string, object?>>();
             var qualityLinks = new List<string>();
             var backupProxies = new List<Dictionary<string, object?>>();
@@ -879,7 +1335,7 @@ public sealed class KeeperService
                 {
                     continue;
                 }
-                if (delay < State.QuarantineMaxLatencyMs)
+                if (delay < MainLatencyLimit)
                 {
                     qualityProxies.Add(hit.proxy);
                     qualityLinks.Add(hit.link);
@@ -905,10 +1361,22 @@ public sealed class KeeperService
                     QualityKey = GetQualityKey(item),
                     Security = EvaluateSecurity(item).Level,
                     Source = SourceOfHostPort(sourceByHostPort, item.Address, item.Port),
+                    Stability = EvaluateStability(State.QualityHistory.GetValueOrDefault(GetQualityKey(item)), DateTime.Now).Level,
                 })
                 .ToList();
             if (qualityProxies.Count == 0)
             {
+                // 新节点一个都没达标，也不能跳过池内复审：不安全 / 非海外的旧节点照样清掉，否则会一直留在池里被选中
+                var evictedWhileRetained = await AuditExistingPoolAsync();
+                if (evictedWhileRetained > 0)
+                {
+                    State.Nodes = BuildNodes(await AppManager.Instance.ProfileItems(SubId) ?? []);
+                    if (_config.IndexId == GroupIndexId && _reloadFunc != null)
+                    {
+                        Logging.SaveLog($"KeeperService: pool membership changed (-{evictedWhileRetained}), reloading core");
+                        await _reloadFunc();
+                    }
+                }
                 await File.WriteAllTextAsync(Path.Combine(WorkDir, "backup.yaml"), BuildClashYaml(backupProxies));
                 State.BackupCount = backupProxies.Count;
                 State.BackupNodes = backupNodes;
@@ -937,6 +1405,19 @@ public sealed class KeeperService
                 regionCount[rg0] = regionCount.GetValueOrDefault(rg0) + 1;
             }
             var regionCap = (int)Math.Ceiling(target * 0.4);
+            // 实测出口在中国大陆或港澳台的节点不进池（名称闸漏网的，这里按出口归属把关）
+            var nonOverseasLinks = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var link in qualityLinks)
+            {
+                if (FmtHandler.ResolveConfig(link, out _) is { } exitCandidate && IsNonOverseasExit(exitCandidate))
+                {
+                    nonOverseasLinks.Add(link);
+                }
+            }
+            if (nonOverseasLinks.Count > 0)
+            {
+                Logging.SaveLog($"KeeperService: skipped {nonOverseasLinks.Count} non-overseas exit nodes (exit in CN/HK/MO/TW)");
+            }
             var importLinks = new List<string>();
             foreach (var link in qualityLinks)
             {
@@ -945,7 +1426,7 @@ public sealed class KeeperService
                     break;
                 }
                 var hp = ParseHostPort(link);
-                if (hp == null || inPool.Contains($"{hp.Value.host.ToLowerInvariant()}:{hp.Value.port}"))
+                if (hp == null || nonOverseasLinks.Contains(link) || inPool.Contains($"{hp.Value.host.ToLowerInvariant()}:{hp.Value.port}"))
                 {
                     continue;
                 }
@@ -968,19 +1449,9 @@ public sealed class KeeperService
             }
             State.QualityLinks = qualityLinks;
 
-            // 7. security filter：池内已有节点按同一口径复审（老版本放进来的、链接被改过的），低安全的一律出池
+            // 7. security filter：池内已有节点按同一口径复审（老版本放进来的、链接被改过的），不合规的一律出池
+            var evictedCount = await AuditExistingPoolAsync();
             var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
-            var bad = items.Where(t => !t.IsValid() || t.GetAllowInsecure() || !SecurityAllows(t)).ToList();
-            if (bad.Count > 0)
-            {
-                foreach (var evicted in bad)
-                {
-                    Logging.SaveLog($"KeeperService security audit: evicted '{evicted.Remarks}' ({EvaluateSecurity(evicted).Reason})");
-                }
-                State.SecurityAudit.Evicted = bad.Count;
-                await ConfigHandler.RemoveServers(_config, bad);
-                items = items.Except(bad).ToList();
-            }
 
             // 8. policy group + active
             await EnsureGroupAsync();
@@ -992,12 +1463,21 @@ public sealed class KeeperService
                     await _reloadFunc();
                 }
             }
-            else if (_config.IndexId == GroupIndexId && (importLinks.Count > 0 || bad.Count > 0) && _reloadFunc != null)
+            else if (_config.IndexId == GroupIndexId && (importLinks.Count > 0 || evictedCount > 0) && _reloadFunc != null)
             {
                 // 策略组按订阅筛选条件动态取成员：新节点入池、或不安全节点被剔除后，
                 // 必须重载内核，运行中的配置才会跟着变（否则要等下次切线或重启才生效）。
-                Logging.SaveLog($"KeeperService: pool membership changed (+{importLinks.Count} / -{bad.Count}), reloading core");
+                Logging.SaveLog($"KeeperService: pool membership changed (+{importLinks.Count} / -{evictedCount}), reloading core");
                 await _reloadFunc();
+            }
+
+            // 8b. 选路：内核重载后选择器会复位，重新按策略应用（手动指定 > 自动优选）
+            if (_coreApiOk)
+            {
+                for (var attempt = 0; attempt < 4 && !await ApplySelectionAsync(); attempt++)
+                {
+                    await Task.Delay(1500);
+                }
             }
 
             // 9. state + reload
@@ -1013,8 +1493,8 @@ public sealed class KeeperService
                 ? $"刷新完成 · 已测速 {parsed.Count} 个节点 · 拦截 {State.SecurityAudit.Rejected} 个不安全节点"
                 : $"刷新完成 · 已测速 {parsed.Count} 个节点";
 
-            NoticeManager.Instance.SendMessage($"畅连管家：换血完成——真测速 {parsed.Count} 个、隔离晋升 {qualityProxies.Count} 个入主池、备用池 {backupProxies.Count} 个兜底、拦截 {State.SecurityAudit.Rejected} 个不安全节点");
-            Logging.SaveLog($"KeeperService refreshed: tested={parsed.Count} pool={items.Count} quality={qualityProxies.Count} backup={backupProxies.Count} rejected={State.SecurityAudit.Rejected} evicted={bad.Count}");
+            NoticeManager.Instance.SendMessage($"畅连管家：换血完成——实测 {parsed.Count} 个节点，{qualityProxies.Count} 个达标进入主池，{backupProxies.Count} 个留作备用，拦截 {State.SecurityAudit.Rejected} 个不安全节点");
+            Logging.SaveLog($"KeeperService refreshed: tested={parsed.Count} pool={items.Count} quality={qualityProxies.Count} backup={backupProxies.Count} rejected={State.SecurityAudit.Rejected} evicted={evictedCount} exits={State.Exits.Count} latencyCap={MainLatencyLimit}ms");
             return true;
         }
         catch (Exception ex)
@@ -1248,26 +1728,134 @@ public sealed class KeeperService
         }
     }
 
-    // 连接/断开：切系统代理（ForcedChange=走畅连 / ForcedClear=全部直连）
+    // 连接/断开：切系统代理（ForcedChange=走畅连 / ForcedClear=全部直连）。
+    // 内核只在连接期间运行：断开就结束内核进程；重新连接时内核没在跑，就先把它拉起来再开系统代理。
     public async Task SetConnectedAsync(bool on)
     {
-        if (_config == null)
-        {
-            return;
-        }
-        var target = on ? ESysProxyType.ForcedChange : ESysProxyType.ForcedClear;
-        if (_config.SystemProxyItem.SysProxyType != target)
-        {
-            _config.SystemProxyItem.SysProxyType = target;
-            var applied = await SysProxyHandler.UpdateSysProxy(_config, false);
-            await ConfigHandler.SaveConfig(_config);
-            if (!applied)
-            {
-                NoticeManager.Instance.SendMessage("系统代理由其他应用使用");
-                return;
-            }
-        }
-        NoticeManager.Instance.SendMessage(on ? "畅连：已连接，浏览器走畅连线路" : "畅连：已断开，浏览器恢复直连");
+    if (_config == null)
+    {
+    return;
+    }
+    var target = on ? ESysProxyType.ForcedChange : ESysProxyType.ForcedClear;
+    if (_config.SystemProxyItem.SysProxyType != target)
+    {
+    _config.SystemProxyItem.SysProxyType = target;
+    if (on && !CoreManager.Instance.IsRunning)
+    {
+    // 重载流程：先起内核，内核就绪后再开系统代理
+    if (!await EnsureCoreRunningAsync())
+    {
+    _config.SystemProxyItem.SysProxyType = ESysProxyType.ForcedClear;
+    await ConfigHandler.SaveConfig(_config);
+    NoticeManager.Instance.SendMessage("畅连：内核没有启动成功，未能连接");
+    return;
+    }
+    }
+    else
+    {
+    var applied = await SysProxyHandler.UpdateSysProxy(_config, false);
+    if (!applied)
+    {
+    NoticeManager.Instance.SendMessage("系统代理由其他应用使用");
+    return;
+    }
+    }
+    await ConfigHandler.SaveConfig(_config);
+    }
+    await SyncCoreWithConnectionAsync(on);
+    NoticeManager.Instance.SendMessage(on ? "畅连：已连接，浏览器走畅连线路" : "畅连：已断开，浏览器恢复直连，内核进程已退出");
+    }
+
+    // 内核是否应该在后台运行：只在连接状态；TUN 模式开启时也一样（未连接就不留内核，TUN 随内核一起停）
+    public static bool CoreShouldRun(ESysProxyType sysProxyType)
+        => sysProxyType == ESysProxyType.ForcedChange;
+
+    // 拉起内核；已经在运行则直接返回 true，起不来返回 false
+    private async Task<bool> EnsureCoreRunningAsync()
+    {
+    if (CoreManager.Instance.IsRunning)
+    {
+    return true;
+    }
+    if (_reloadFunc == null)
+    {
+    return false;
+    }
+    await _reloadFunc();
+    for (var i = 0; i < 20 && !CoreManager.Instance.IsRunning; i++)
+    {
+    await Task.Delay(250);
+    }
+    if (!CoreManager.Instance.IsRunning)
+    {
+    return false;
+    }
+    // 重新计启动宽限：内核刚起来的几次探测不作数
+    _startedAt = DateTime.Now;
+    lock (_probeWindow)
+    {
+    _probeWindow.Clear();
+    }
+    return true;
+    }
+
+    // 让内核进程与连接状态保持一致：断开 → 结束内核，后台不留代理进程；连接 → 需要时拉起内核并立即探测一次
+    private async Task SyncCoreWithConnectionAsync(bool startIfNeeded)
+    {
+    try
+    {
+    if (_config == null)
+    {
+    return;
+    }
+    if (CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+    {
+    if (startIfNeeded)
+    {
+    if (await EnsureCoreRunningAsync())
+    {
+    await PollStatusAsync(); // 立即探测一次，界面不用等下一个轮询周期
+    }
+    }
+    return;
+    }
+    if (!CoreManager.Instance.IsRunning)
+    {
+    return;
+    }
+    await CoreManager.Instance.CoreStop();
+    State.Online = false;
+    State.LatencyMs = -1;
+    State.ExitNode = State.ExitIp = State.ExitCountry = State.ExitCity = State.ExitIsp = State.ExitCode = string.Empty;
+    lock (_probeWindow)
+    {
+    _probeWindow.Clear();
+    }
+    _startedAt = DateTime.Now; // 下次连接重新计启动宽限
+    Logging.SaveLog("KeeperService: disconnected - core process stopped, nothing left in background");
+    }
+    catch (Exception ex)
+    {
+    Logging.SaveLog("KeeperService sync core with connection", ex);
+    }
+    }
+
+    // 退出前收尾：停掉测速引擎和后台定时器，之后本应用不再有任何子进程
+    public void Shutdown()
+    {
+    try
+    {
+    _timer?.Dispose();
+    _timer = null;
+    _statusTimer?.Dispose();
+    _statusTimer = null;
+    _wsCts?.Cancel();
+    KillProc(Interlocked.Exchange(ref _testProc, null));
+    }
+    catch (Exception ex)
+    {
+    Logging.SaveLog("KeeperService shutdown", ex);
+    }
     }
 
     public async Task SetEnabledAsync(bool on)
@@ -1292,15 +1880,25 @@ public sealed class KeeperService
         }
         if (on)
         {
+            State.PinnedIndexId = State.PinnedRemarks = string.Empty;
             await ConfigHandler.SetDefaultServerIndex(_config, GroupIndexId);
+            _ = _reloadFunc?.Invoke();
         }
         else
         {
+            // 关闭自动切换 = 锁定当前线路：把当前在用的节点转成手动指定（仍可在节点页手动更换）
             var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
-            await ApplyActiveAsync(items);
+            var current = MatchIndexId(_selectorNow, items);
+            if (current.IsNotEmpty())
+            {
+                State.PinnedIndexId = current;
+                State.PinnedRemarks = items.FirstOrDefault(t => t.IndexId == current)?.Remarks ?? string.Empty;
+            }
         }
-        _ = _reloadFunc?.Invoke();
-        NoticeManager.Instance.SendMessage(on ? "畅连管家：自动切换最快线路已开启" : "畅连管家：已锁定当前线路，不再自动切换");
+        SaveState();
+        NoticeManager.Instance.SendMessage(on
+            ? "畅连管家：自动优选已开启（安全 > 稳定 > 带宽 > 延迟）"
+            : "畅连管家：已锁定当前线路，不再自动切换（可在节点页手动更换）");
     }
 
     public void SetDailyRefresh(bool on)
@@ -1320,7 +1918,7 @@ public sealed class KeeperService
         {
             return null;
         }
-        foreach (var client in new[] { _subscriptionClient })
+        foreach (var client in PoolFetchClients())
         {
             try
             {
@@ -1334,8 +1932,30 @@ public sealed class KeeperService
             }
             catch (HttpRequestException) { }
             catch (TaskCanceledException) { }
+            finally
+            {
+                if (!ReferenceEquals(client, _subscriptionClient))
+                {
+                    client.Dispose();
+                }
+            }
         }
         return null;
+    }
+
+    // 取节点来源的客户端链：先直连；直连取不到（raw.githubusercontent.com 时常被阻断）再经本地内核走当前线路
+    private IEnumerable<HttpClient> PoolFetchClients()
+    {
+        yield return _subscriptionClient;
+        var port = AppManager.Instance.GetLocalPort(EInboundProtocol.socks);
+        if (port is >= 1 and <= 65535)
+        {
+            yield return new HttpClient(new HttpClientHandler { Proxy = new WebProxy($"http://{Global.Loopback}:{port}") })
+            {
+                Timeout = TimeSpan.FromSeconds(20),
+                MaxResponseContentBufferSize = 2 * 1024 * 1024,
+            };
+        }
     }
 
     private static IEnumerable<string> ExtractLinks(string body)
@@ -1505,12 +2125,134 @@ public sealed class KeeperService
     // 是否允许注入：等级不低于门槛（ParsePoolCandidate 候选闸与池内复审共用）
     internal static bool SecurityAllows(ProfileItem item) => SecurityRank(EvaluateSecurity(item).Level) >= _minSecurityRank;
 
+    // ---- 节点名称闸：国内 / 港澳台（非海外）/ 日抛节点不进池 ----
+    // 国内 = 名称带中国大陆标识（"CN2" 是线路类型不算）；出口实际在哪由换血时的出口查询把关
+    private static readonly System.Text.RegularExpressions.Regex DomesticNameRx = new(
+        @"中国|大陆|回国|国内|🇨🇳|(?<![A-Za-z])CHN(?![A-Za-z])|(?<![A-Za-z0-9])CN(?![A-Za-z0-9])"
+        + @"|China(?!\s?(Telecom|Unicom|Mobile|Netcom))"
+        + @"|上海|北京|深圳|广州|杭州|苏州|南京|成都|重庆|天津|武汉|西安|郑州|长沙|合肥|济南|青岛|厦门|福州|宁波|无锡|佛山|东莞"
+        + @"|沈阳|哈尔滨|长春|石家庄|太原|昆明|贵阳|南宁|兰州|西宁|银川|拉萨|乌鲁木齐|呼和浩特|海口|南昌",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // 日抛 = 名称标注了当天 / 限时 / 临时有效
+    private static readonly System.Text.RegularExpressions.Regex EphemeralNameRx = new(
+        @"日抛|限时|临时|短期|今日|每日|当天|存活|过期|(?<![A-Za-z0-9])24\s*[hH](?![A-Za-z])",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // 港澳台 = 非海外（规则：节点只能是海外安全节点）
+    private static readonly System.Text.RegularExpressions.Regex HmtNameRx = new(
+        @"香港|港澳台|澳门|澳門|台湾|台灣|台北|新北|桃園|桃园|台中|台南|高雄|🇭🇰|🇲🇴|🇹🇼"
+        + @"|Hong\s*Kong|Macau|Macao|Taiwan|Taipei|(?<![A-Za-z0-9])HK(?![A-Za-z])|(?<![A-Za-z0-9])MO(?![A-Za-z])|(?<![A-Za-z0-9])TW(?![A-Za-z])",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    internal static string? NameRejection(string? remarks)
+    {
+        var name = remarks ?? string.Empty;
+        if (DomesticNameRx.IsMatch(name))
+        {
+            return "国内节点";
+        }
+        if (HmtNameRx.IsMatch(name))
+        {
+            return "港澳台节点（非海外）";
+        }
+        return EphemeralNameRx.IsMatch(name) ? "日抛节点" : null;
+    }
+
+    // ---- 出口归属 ----
+    // ip-api.com 的返回 → 出口信息
+    internal static KeeperExit? ParseExitInfo(string json)
+    {
+        var node = JsonUtils.ParseJson(json);
+        if (node?["status"]?.GetValue<string>() != "success")
+        {
+            return null;
+        }
+        return new KeeperExit
+        {
+            Ip = node!["query"]?.GetValue<string>() ?? string.Empty,
+            Country = node["country"]?.GetValue<string>() ?? string.Empty,
+            CountryCode = node["countryCode"]?.GetValue<string>() ?? string.Empty,
+            City = node["city"]?.GetValue<string>() ?? string.Empty,
+            Isp = node["isp"]?.GetValue<string>() ?? string.Empty,
+            Org = node["org"]?.GetValue<string>() ?? string.Empty,
+            Hosting = node["hosting"]?.GetValue<bool>() ?? false,
+            Proxy = node["proxy"]?.GetValue<bool>() ?? false,
+            At = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+        };
+    }
+
+    private static readonly Dictionary<string, string> ZhCountry = new()
+    {
+        ["US"] = "美国", ["DE"] = "德国", ["GB"] = "英国", ["FR"] = "法国", ["JP"] = "日本", ["SG"] = "新加坡",
+        ["KR"] = "韩国", ["CA"] = "加拿大", ["AU"] = "澳大利亚", ["NL"] = "荷兰", ["HK"] = "香港", ["TW"] = "台湾",
+        ["MO"] = "澳门", ["RU"] = "俄罗斯", ["IN"] = "印度", ["TR"] = "土耳其", ["IT"] = "意大利", ["BR"] = "巴西",
+        ["PL"] = "波兰", ["FI"] = "芬兰", ["SE"] = "瑞典", ["CH"] = "瑞士", ["IE"] = "爱尔兰", ["NO"] = "挪威",
+        ["AT"] = "奥地利", ["BE"] = "比利时", ["ES"] = "西班牙", ["PT"] = "葡萄牙", ["CZ"] = "捷克", ["DK"] = "丹麦",
+        ["UA"] = "乌克兰", ["VN"] = "越南", ["TH"] = "泰国", ["MY"] = "马来西亚", ["PH"] = "菲律宾", ["ID"] = "印尼",
+        ["MX"] = "墨西哥", ["AR"] = "阿根廷", ["CL"] = "智利", ["ZA"] = "南非", ["AE"] = "阿联酋", ["IL"] = "以色列",
+        ["LU"] = "卢森堡", ["MD"] = "摩尔多瓦", ["BG"] = "保加利亚", ["HU"] = "匈牙利", ["RO"] = "罗马尼亚",
+        ["LT"] = "立陶宛", ["LV"] = "拉脱维亚", ["EE"] = "爱沙尼亚", ["GR"] = "希腊", ["IS"] = "冰岛", ["NZ"] = "新西兰",
+        ["CN"] = "中国",
+    };
+
+    // 出口地名：国家（中文，未收录的用英文国名）+ 城市
+    internal static string ExitPlace(KeeperExit exitInfo)
+    {
+        var country = ZhCountry.GetValueOrDefault(exitInfo.CountryCode, exitInfo.Country);
+        return string.Join(" ", new[] { country, exitInfo.City }.Where(part => part.IsNotEmpty()));
+    }
+
+    // ISO 两字母国家码 → 国旗（区域指示符）；不是合法国家码时返回空串
+    public static string FlagOf(string? code)
+    {
+        if (code == null || code.Length != 2)
+        {
+            return string.Empty;
+        }
+        var a = char.ToUpperInvariant(code[0]);
+        var b = char.ToUpperInvariant(code[1]);
+        if ((a is < 'A' or > 'Z') || (b is < 'A' or > 'Z'))
+        {
+            return string.Empty;
+        }
+        return string.Concat(char.ConvertFromUtf32(0x1F1E6 + a - 'A'), char.ConvertFromUtf32(0x1F1E6 + b - 'A'));
+    }
+
+    // 协议简称（来自节点链接本身，不是节点池写的名称）
+    public static string ProtocolOf(EConfigType type) => type switch
+    {
+        EConfigType.Shadowsocks => "SS",
+        EConfigType.Hysteria2 => "Hy2",
+        EConfigType.WireGuard => "WG",
+        EConfigType.Anytls => "AnyTLS",
+        EConfigType.SOCKS => "Socks",
+        EConfigType.HTTP => "HTTP",
+        _ => type.ToString(),
+    };
+
+    // 带宽档位：2 = 2 MB/s 以上（4K 视频、大文件都够用）；1 = 0.5 MB/s 以上（1080p 够用）；0 = 更慢或未测
+    internal static int SpeedTier(double kbPerSecond) => kbPerSecond >= 2048 ? 2 : kbPerSecond >= 512 ? 1 : 0;
+
+    internal static string SpeedText(double kbPerSecond)
+    {
+        return kbPerSecond <= 0 ? string.Empty
+            : kbPerSecond >= 1024 ? $"{kbPerSecond / 1024:F1} MB/s"
+            : $"{kbPerSecond:F0} KB/s";
+    }
+
     // 候选被闸拦下时，若原因是安全等级不足则计入分布（解析失败不算安全拦截）
     private static void CountSecurityRejection(string link, Dictionary<string, int> reasons)
     {
         var profile = FmtHandler.ResolveConfig(link, out _);
         if (profile == null || !profile.IsValid())
         {
+            return;
+        }
+        var nameReason = NameRejection(profile.Remarks);
+        if (nameReason != null)
+        {
+            reasons[nameReason] = reasons.GetValueOrDefault(nameReason) + 1;
             return;
         }
         var (level, reason) = EvaluateSecurity(profile);
@@ -1541,7 +2283,7 @@ public sealed class KeeperService
     private static string SourceOfHostPort(Dictionary<string, string> sourceByHostPort, string host, int port)
         => sourceByHostPort.GetValueOrDefault($"{(host ?? string.Empty).TrimEnd('.').ToLowerInvariant()}:{port}", string.Empty);
 
-    // 池内节点 → 界面展示模型：安全等级按同口径现算，来源优先取本轮抓取记录、其次沿用上次记录
+    // 池内节点 → 界面展示模型：安全等级、出口归属、稳定天数按现有数据现算，来源优先取本轮抓取记录、其次沿用上次记录
     private List<KeeperNode> BuildNodes(List<ProfileItem> items, Dictionary<string, string>? sourceByHostPort = null)
     {
         var known = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -1553,14 +2295,36 @@ public sealed class KeeperService
         {
             var key = GetQualityKey(t);
             var src = sourceByHostPort != null ? SourceOfHostPort(sourceByHostPort, t.Address, t.Port) : string.Empty;
+            State.Exits.TryGetValue(key, out var exitInfo);
+            var stability = EvaluateStability(State.QualityHistory.GetValueOrDefault(key), DateTime.Now);
+            var nameRegion = RegionOf(t.Remarks);
+            var nameMismatch = exitInfo != null && exitInfo.CountryCode.Length > 0 && nameRegion != "OTHER"
+                && !nameRegion.Equals(exitInfo.CountryCode, StringComparison.OrdinalIgnoreCase);
             return new KeeperNode
             {
+                IndexId = t.IndexId,
                 Remarks = t.Remarks,
                 Host = t.Address,
                 Port = t.Port,
                 QualityKey = key,
                 Security = EvaluateSecurity(t).Level,
+                SecurityReason = EvaluateSecurity(t).Reason,
                 Source = src.Length > 0 ? src : known.GetValueOrDefault(key, string.Empty),
+                Exit = exitInfo == null ? string.Empty : ExitPlace(exitInfo),
+                ExitIp = exitInfo?.Ip ?? string.Empty,
+                NetType = exitInfo?.NetType ?? string.Empty,
+                Isp = exitInfo?.Isp ?? string.Empty,
+                Speed = exitInfo == null ? string.Empty : SpeedText(exitInfo.DownKBs),
+                ProxyFlag = exitInfo?.Proxy ?? false,
+                AliveDays = AliveDaysOf(t),
+                Stability = stability.Level,
+                StabilityReason = stability.Reason,
+                NameMismatch = nameMismatch,
+                Protocol = ProtocolOf(t.ConfigType),
+                ExitCode = exitInfo?.CountryCode ?? string.Empty,
+                NameNote = nameMismatch
+                    ? $"节点池原名标注的地区（{ZhCountry.GetValueOrDefault(nameRegion, nameRegion)}）与实测出口不符，以实测为准"
+                    : string.Empty,
             };
         }).ToList();
     }
@@ -1580,6 +2344,10 @@ public sealed class KeeperService
         if (!SecurityAllows(profile))
         {
             return null; // 安全等级低于门槛（弱加密 / 明文 / 跳过证书校验 / 内网地址）：换血与补位任何阶段都不注入
+        }
+        if (NameRejection(profile.Remarks) != null)
+        {
+            return null; // 国内 / 日抛节点：名称命中即不进候选（出口是否真在大陆另由换血时的出口查询把关）
         }
 
         var host = profile.Address.TrimEnd('.');
@@ -1994,7 +2762,12 @@ public sealed class KeeperService
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
-            return Process.Start(psi);
+            var proc = Process.Start(psi);
+            if (proc != null)
+            {
+                CoreManager.Instance.RegisterChildProcess(proc);
+            }
+            return proc;
         }
         catch (Exception ex)
         {
@@ -2009,6 +2782,7 @@ public sealed class KeeperService
         {
             if (p != null && !p.HasExited)
             {
+                CoreManager.Instance.ForgetChildProcess(p.Id);
                 p.Kill(true);
             }
         }
@@ -2019,20 +2793,14 @@ public sealed class KeeperService
     {
         try
         {
-            using var tcp = new TcpClient();
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             var addresses = await Dns.GetHostAddressesAsync(host, timeout.Token);
             if (addresses.Length == 0 || addresses.Any(address => !IsPublicAddress(address))) { return -1; }
-            var connect = tcp.ConnectAsync(addresses, port);
-            if (await Task.WhenAny(connect, Task.Delay(3000)) != connect)
-            {
-                return -1;
-            }
-            if (!tcp.Connected)
-            {
-                return -1;
-            }
+            using var tcp = new TcpClient();
+            // 可取消的连接：超时由同一个 token 触发，任务被正常等待并结束，
+            // 不会留下"连接进行中就被释放"的孤儿任务（那种任务会在 GC 时以 SocketException 报成 ERROR）
+            await tcp.ConnectAsync(addresses, port, timeout.Token);
             sw.Stop();
             return (int)sw.ElapsedMilliseconds;
         }
@@ -2048,21 +2816,58 @@ public sealed class KeeperService
         try
         {
             var path = Utils.GetConfigPath("keeper.json");
-            if (File.Exists(path))
+            if (!File.Exists(path))
             {
-                var st = JsonUtils.Deserialize<KeeperState>(File.ReadAllText(path));
-                if (st != null)
-                {
-                    State = st;
-                    State.SecurityAudit ??= new();
-                    _minSecurityRank = Math.Max(1, SecurityRank(State.MinSecurity));
-                }
+                Logging.SaveLog($"KeeperService load state: {path} not found — trying keeper.json.bak");
+                TryLoadStateBackup(path);
+                return;
             }
+            var st = JsonUtils.Deserialize<KeeperState>(File.ReadAllText(path));
+            if (st == null)
+            {
+                // 读失败不再静默：原件留作排查依据，再尝试 .bak
+                Logging.SaveLog($"KeeperService load state: DESERIALIZE FAILED ({new FileInfo(path).Length} bytes) — original kept as keeper.json.bad, trying keeper.json.bak");
+                try { File.Copy(path, path + ".bad", true); } catch { }
+                TryLoadStateBackup(path);
+                return;
+            }
+            AdoptState(st);
+            Logging.SaveLog($"KeeperService load state: ok nodes={st.Nodes.Count} history={st.QualityHistory.Count} exits={st.Exits.Count} backup={st.BackupNodes.Count} lastRefresh={st.LastRefresh}");
         }
         catch (Exception ex)
         {
             Logging.SaveLog("KeeperService load state", ex);
         }
+    }
+
+    private void AdoptState(KeeperState st)
+    {
+        State = st;
+        State.SecurityAudit ??= new();
+        State.Exits ??= new();
+        State.Nodes ??= [];
+        State.QualityHistory ??= [];
+        State.BackupNodes ??= [];
+        State.QualityLinks ??= [];
+        _minSecurityRank = Math.Max(1, SecurityRank(State.MinSecurity));
+    }
+
+    // 主文件读不出来时，用上一次保存前的快照（keeper.json.bak）顶上，历史不丢
+    private void TryLoadStateBackup(string path)
+    {
+        var bak = path + ".bak";
+        if (!File.Exists(bak))
+        {
+            return;
+        }
+        var st = JsonUtils.Deserialize<KeeperState>(File.ReadAllText(bak));
+        if (st == null)
+        {
+            Logging.SaveLog("KeeperService load state: keeper.json.bak unreadable too");
+            return;
+        }
+        AdoptState(st);
+        Logging.SaveLog($"KeeperService load state: RESTORED from keeper.json.bak (nodes={st.Nodes.Count} history={st.QualityHistory.Count} lastRefresh={st.LastRefresh})");
     }
 
     private readonly object _stateWriteLock = new();
@@ -2074,7 +2879,26 @@ public sealed class KeeperService
             try
             {
                 var path = Utils.GetConfigPath("keeper.json");
-                WriteStateFile(path, JsonUtils.Serialize(State));
+                var contents = JsonUtils.Serialize(State);
+                if (File.Exists(path))
+                {
+                    var existing = File.ReadAllText(path);
+                    // 空状态不许覆盖有数据的文件：状态丢失/读坏时，宁可少存一次也不抹掉历史
+                    if (State.Nodes.Count == 0 && State.QualityHistory.Count == 0 && State.BackupNodes.Count == 0)
+                    {
+                        var previous = JsonUtils.Deserialize<KeeperState>(existing);
+                        if (previous != null && (previous.Nodes.Count > 0 || previous.QualityHistory.Count > 0))
+                        {
+                            Logging.SaveLog($"KeeperService save state: SKIPPED — refusing to overwrite keeper.json (nodes={previous.Nodes.Count} history={previous.QualityHistory.Count}) with an empty state");
+                            return;
+                        }
+                    }
+                    if (existing != contents)
+                    {
+                        File.WriteAllText(path + ".bak", existing);
+                    }
+                }
+                WriteStateFile(path, contents);
             }
             catch (Exception ex)
             {
@@ -2084,7 +2908,7 @@ public sealed class KeeperService
         }
     }
 
-    private static void WriteStateFile(string path, string contents)
+        private static void WriteStateFile(string path, string contents)
     {
         var staged = path + ".tmp";
         File.WriteAllText(staged, contents);
@@ -2134,6 +2958,16 @@ public class KeeperState
 
     // ---- 节点安全审查 ----
     public string MinSecurity { get; set; } = "中"; // 注入门槛：中 = 放行「中」「高」；高 = 只放行「高」；「低」无论如何都拦截
+
+    // ---- 选路与准入 ----
+    public int MaxLatencyMs { get; set; } = 1200;             // 主池延迟上限：实测延迟高于此值的不进主池（只留作备用）；默认 1200，可用节点更多
+    public string PinnedIndexId { get; set; } = string.Empty; // 手动指定的节点（IndexId）；为空 = 自动选路
+    public string PinnedRemarks { get; set; } = string.Empty;
+    public string ActiveIndexId { get; set; } = string.Empty; // 内核当前实际在用的节点
+    public string SelectMode { get; set; } = string.Empty;     // 选路说明：手动 · X / 自动 · X
+    public Dictionary<string, KeeperExit> Exits { get; set; } = []; // 节点（QualityKey）→ 出口 IP 归属
+    [System.Text.Json.Serialization.JsonIgnore] public Dictionary<string, int> KernelDelays { get; set; } = []; // 节点 IndexId → 内核最近测速延迟（运行时同步，不落盘）
+    [System.Text.Json.Serialization.JsonIgnore] public Dictionary<string, string> KernelDelayTimes { get; set; } = []; // 对应测速时间 HH:mm:ss
     public KeeperSecurityAudit SecurityAudit { get; set; } = new(); // 最近一轮安全审查结果
     public Dictionary<string, int> DegradeMap { get; set; } = []; // 节点进连续劣化轮数
 
@@ -2151,6 +2985,7 @@ public class KeeperState
     public string ExitNode { get; set; } = string.Empty;
     public string ExitIp { get; set; } = string.Empty;
     public string ExitCountry { get; set; } = string.Empty;
+    public string ExitCode { get; set; } = string.Empty;    // 实测出口的 ISO 国家码（国旗用）
     public string ExitCity { get; set; } = string.Empty;
     public string ExitIsp { get; set; } = string.Empty;
     public int LatencyMs { get; set; } = -1;
@@ -2166,6 +3001,32 @@ public class KeeperNode
     public int Port { get; set; }
     public string Source { get; set; } = string.Empty;   // 来源池（owner/repo 短名）
     public string Security { get; set; } = string.Empty; // 安全等级：高 / 中
+    public string SecurityReason { get; set; } = string.Empty; // 评级依据，如「SS AEAD 直连（流量特征可识别）」
+    public string IndexId { get; set; } = string.Empty;
+    public string Exit { get; set; } = string.Empty;      // 出口：国家 城市
+    public string ExitIp { get; set; } = string.Empty;
+    public string NetType { get; set; } = string.Empty;   // 机房 / 家宽
+    public string Isp { get; set; } = string.Empty;       // 运营商
+    public int AliveDays { get; set; } = -1;              // 稳定天数（-1 = 无记录）
+    public string Speed { get; set; } = string.Empty;      // 实测下行速度，如 "12.3 MB/s"
+    public bool ProxyFlag { get; set; }                    // 已知代理 / VPN 出口（部分 AI 服务会拦截）
+    public string Stability { get; set; } = string.Empty;   // 稳定等级：高 / 中 / 低（依据见 StabilityReason）
+    public string StabilityReason { get; set; } = string.Empty;
+    public bool NameMismatch { get; set; }                  // 节点池原名标注的地区与实测出口不符
+    public string Protocol { get; set; } = string.Empty;  // 协议（从节点链接解析）：SS / VMess / VLESS / Trojan / Hy2 …
+    public string ExitCode { get; set; } = string.Empty;  // 实测出口的 ISO 国家码（用来生成国旗）
+    public string NameNote { get; set; } = string.Empty;  // 节点池原名与实测出口的关系说明（空 = 一致或无法判断）
+
+    // 界面显示名全部来自应用自己的检测：实测出口（国旗 国家 城市）+ 协议。节点池写的原始名称只放在悬停提示里，不作依据。
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string Name
+    {
+        get
+        {
+            var place = Exit.Length > 0 ? KeeperService.FlagOf(ExitCode) + " " + Exit : "出口未探测";
+            return place.Trim() + (Protocol.Length > 0 ? " · " + Protocol : string.Empty);
+        }
+    }
 }
 
 [Serializable]
@@ -2182,4 +3043,23 @@ public sealed class KeeperQuality
 {
     public List<int> Samples { get; set; } = [];
     public DateTime TestedAt { get; set; }
+    public DateTime FirstSeen { get; set; } // 首次测通时间：稳定天数从这里起算
+}
+
+/// <summary>节点出口 IP 的归属（换血时经节点本身查询得到）</summary>
+public class KeeperExit
+{
+    public string Ip { get; set; } = string.Empty;
+    public string Country { get; set; } = string.Empty;
+    public string CountryCode { get; set; } = string.Empty;
+    public string City { get; set; } = string.Empty;
+    public string Isp { get; set; } = string.Empty;
+    public string Org { get; set; } = string.Empty;
+    public bool Hosting { get; set; }  // 机房 / 数据中心 IP；false = 住宅或普通宽带
+    public bool Proxy { get; set; }    // 已知代理 / VPN 出口
+    public double DownKBs { get; set; }  // 实测下行速度（KB/s），0 = 未测
+    public string At { get; set; } = string.Empty;
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string NetType => Hosting ? "机房" : "家宽";
 }

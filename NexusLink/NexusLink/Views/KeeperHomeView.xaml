@@ -54,25 +54,108 @@
                     </ComboBox>
                     <TextBox x:Name="Search" Grid.Column="1" Foreground="#F1F1F1" CaretBrush="#F1F1F1" Margin="0,0,16,0"
                              AutomationProperties.Name="搜索节点" TextChanged="SearchChanged"/>
-                    <Button x:Name="NodesRefreshButton" Grid.Column="2" Content="刷新与测速" Style="{StaticResource Action}" Click="Refresh"/>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock x:Name="SelectModeText" Style="{StaticResource Muted}" TextWrapping="NoWrap" Margin="0,0,14,0" VerticalAlignment="Center"/>
+                        <Button x:Name="UseNodeButton" Content="用这个节点" Style="{StaticResource Action}" Click="UseSelectedNode" IsEnabled="False" AutomationProperties.Name="用这个节点"/>
+                        <Button x:Name="AutoSelectButton" Content="恢复自动" Style="{StaticResource Action}" Click="UseAutoSelect" IsEnabled="False" AutomationProperties.Name="恢复自动"/>
+                        <Button x:Name="NodesRefreshButton" Content="刷新与测速" Style="{StaticResource Action}" Click="Refresh" Margin="0"/>
+                    </StackPanel>
                 </Grid>
                 <TextBlock x:Name="NodeSummary" DockPanel.Dock="Top" Style="{StaticResource Muted}" Margin="0,0,0,10"/>
                 <DataGrid x:Name="Nodes" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" RowHeight="36"
                           Foreground="#EFEFEF" Background="#212121" RowBackground="#212121" AlternatingRowBackground="#262626"
-                          GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#373737" HeadersVisibility="Column">
+                          GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#373737" HeadersVisibility="Column"
+                          MouseDoubleClick="NodesDoubleClick">
+                    <DataGrid.RowStyle>
+                        <Style TargetType="DataGridRow">
+                            <Setter Property="ToolTip" Value="{Binding Tip}"/>
+                        </Style>
+                    </DataGrid.RowStyle>
                     <DataGrid.ColumnHeaderStyle><Style TargetType="DataGridColumnHeader">
                         <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/>
                         <Setter Property="Padding" Value="9,8"/>
                     </Style></DataGrid.ColumnHeaderStyle>
                     <DataGrid.Columns>
-                        <DataGridTextColumn Header="节点" Binding="{Binding Remarks}" Width="2*"/>
-                        <DataGridTextColumn Header="地址" Binding="{Binding Host}" Width="*"/>
-                        <DataGridTextColumn Header="端口" Binding="{Binding Port}" Width="65"/>
-                        <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="150"/>
-                        <DataGridTextColumn Header="安全" Binding="{Binding Security}" Width="60"/>
-                        <DataGridTextColumn Header="延迟" Binding="{Binding LatencyMs, TargetNullValue=—, StringFormat={}{0} ms}" Width="85"/>
-                        <DataGridTextColumn Header="检测通过率" Binding="{Binding SuccessRate, TargetNullValue=—, StringFormat={}{0:P0}}" Width="100"/>
-                        <DataGridTextColumn Header="最近检测" Binding="{Binding TestedAt, TargetNullValue=—, StringFormat={}{0:MM-dd HH:mm}}" Width="110"/>
+                        <DataGridTemplateColumn Header="节点" Width="2*">
+                            <DataGridTemplateColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="名称来自实测出口和协议，右侧小字是实测出口 IP。悬停某一行可看节点池原名"/>
+                                </Style>
+                            </DataGridTemplateColumn.HeaderStyle>
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding Name}" VerticalAlignment="Center"/>
+                                        <TextBlock Text="{Binding NameSub}" Margin="8,0,0,0" FontSize="11" Opacity="0.55" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
+                        <DataGridTextColumn Header="出口" Binding="{Binding Exit}" Width="140">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="实测出口：经该节点访问 IP 归属服务查得，随每次换血更新。节点名称就是按这个实测结果显示的"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
+                        <DataGridTextColumn Header="类型" Binding="{Binding NetType}" Width="58">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="出口 IP 类型：机房或家宽"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
+                        <DataGridTextColumn Header="安全" Binding="{Binding Security}" Width="52">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="高 = TLS / Reality 加密；中 = 已加密但流量特征可识别。弱加密、明文、跳过证书校验的节点不入池"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
+                        <DataGridTextColumn Header="稳定" Binding="{Binding Stability}" Width="62">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="高 = 出现 ≥ 3 天且通过率 ≥ 90%；中 = 出现 ≥ 1 天且通过率 ≥ 70%；低 = 记录不足 1 天"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
+                        <DataGridTextColumn Header="延迟" Binding="{Binding LatencyMs, TargetNullValue=—, StringFormat={}{0} ms}" Width="80">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="内核最近一次测速；没有记录时显示上次换血的实测值"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
+                        <DataGridTextColumn Header="速度" Binding="{Binding Speed}" Width="88">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="换血时经该节点实际下载测得；没测过的显示 —"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
+                        <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="130">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="该节点来自哪个公益节点池"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
+                        <DataGridTextColumn Header="状态" Binding="{Binding State}" Width="66">
+                            <DataGridTextColumn.HeaderStyle>
+                                <Style TargetType="DataGridColumnHeader">
+                                    <Setter Property="Background" Value="#2E2E2E"/><Setter Property="Foreground" Value="#DADADA"/><Setter Property="Padding" Value="9,8"/>
+                                    <Setter Property="ToolTip" Value="使用中 = 已连接，流量正走这条线路；当前线路 = 还没连接时，点「立即连接」后会走的线路"/>
+                                </Style>
+                            </DataGridTextColumn.HeaderStyle>
+                        </DataGridTextColumn>
                     </DataGrid.Columns>
                 </DataGrid>
             </DockPanel>
@@ -81,7 +164,7 @@
                     <Border Style="{StaticResource Panel}">
                         <StackPanel>
                             <CheckBox x:Name="AutoSwitch" Foreground="#F1F1F1" Content="自动切换" Click="SwitchChanged"/>
-                            <TextBlock Text="由现有线路策略监测连接并处理故障。" Style="{StaticResource Muted}" Margin="0,7,0,18"/>
+                            <TextBlock Text="开启：按 安全 &gt; 稳定 &gt; 带宽 &gt; 延迟 自动选路，断线时自动换线。关闭：锁定当前节点，可在节点页手动更换。" Style="{StaticResource Muted}" Margin="0,7,0,18"/>
                             <CheckBox x:Name="AutoRefresh" Foreground="#F1F1F1" Content="定时刷新" Click="RefreshChanged"/>
                             <TextBlock x:Name="Interval" Style="{StaticResource Muted}" Margin="0,7,0,0"/>
                         </StackPanel>
@@ -93,8 +176,16 @@
                     <Border Style="{StaticResource Panel}">
                         <StackPanel>
                             <TextBlock Text="应用设置" FontSize="18" FontWeight="SemiBold"/>
-                            <TextBlock Text="管理系统代理、路由和客户端选项。" Style="{StaticResource Muted}" Margin="0,7,0,16"/>
+                            <TextBlock Text="开机自动启动、启动后隐藏窗口、分流规则自动更新。" Style="{StaticResource Muted}" Margin="0,7,0,16"/>
                             <Button Content="打开设置" Click="OpenSettings" Style="{StaticResource Action}" HorizontalAlignment="Left"/>
+                            <TextBlock Text="节点延迟上限" FontSize="18" FontWeight="SemiBold" Margin="0,22,0,6"/>
+                            <ComboBox x:Name="LatencyLimit" SelectionChanged="LatencyLimitChanged" MinWidth="230" HorizontalAlignment="Left"
+                                      AutomationProperties.Name="节点延迟上限">
+                                <ComboBoxItem Content="500 毫秒"/>
+                                <ComboBoxItem Content="800 毫秒"/>
+                                <ComboBoxItem Content="1200 毫秒"/>
+                            </ComboBox>
+                            <TextBlock Text="实测延迟高于上限的节点不进主池，只留作备用。选路顺序：安全 &gt; 稳定 &gt; 带宽 &gt; 延迟，在用的节点只要没问题就不换" Style="{StaticResource Muted}" Margin="0,7,0,0"/>
                         </StackPanel>
                     </Border>
                 </StackPanel>

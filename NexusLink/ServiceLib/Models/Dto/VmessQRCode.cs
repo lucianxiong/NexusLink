@@ -1,7 +1,7 @@
 namespace ServiceLib.Models.Dto;
 
 /// <summary>
-/// https://github.com/2dust/NexusLink/wiki/
+/// VMess 分享链接（vmess:// + base64(JSON)）的字段结构
 /// </summary>
 [Serializable]
 public class VmessQRCode

@@ -118,6 +118,7 @@ public class Inbound4Sbox
     public string? stack { get; set; }
     public List<User4Sbox> users { get; set; }
     public List<string>? route_exclude_address { get; set; }
+    public List<string>? route_address { get; set; }
 }
 
 public class User4Sbox

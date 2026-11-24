@@ -41,6 +41,7 @@ public partial class OptionSettingViewModel : MyReactiveObject, ICloseable
     #region UI
 
     [Reactive] public partial bool AutoRun { get; set; }
+    [Reactive] public partial bool EnableTun { get; set; } // TUN 模式（需要管理员权限）
     [Reactive] public partial bool EnableStatistics { get; set; }
     [Reactive] public partial bool KeepOlderDedupl { get; set; }
     [Reactive] public partial bool DisplayRealTimeSpeed { get; set; }
@@ -175,6 +176,7 @@ public partial class OptionSettingViewModel : MyReactiveObject, ICloseable
         #region UI
 
         AutoRun = _config.GuiItem.AutoRun;
+        EnableTun = _config.TunModeItem.EnableTun;
         EnableStatistics = _config.GuiItem.EnableStatistics;
         DisplayRealTimeSpeed = _config.GuiItem.DisplayRealTimeSpeed;
         KeepOlderDedupl = _config.GuiItem.KeepOlderDedupl;
@@ -402,10 +404,28 @@ public partial class OptionSettingViewModel : MyReactiveObject, ICloseable
         //coreType
         await SaveCoreType();
 
+        // TUN 模式（需要管理员权限）：非管理员开启时请求以管理员重启；被拒绝则回退为关闭
+        var tunResult = TunModeSwitch.Apply(_config, EnableTun, Utils.IsAdministrator(), () => ProcUtils.RebootAsAdmin());
+        if (tunResult == TunSwitchResult.Restarting)
+        {
+            await ConfigHandler.SaveConfig(_config);
+            await AppManager.Instance.AppExitAsync(true);
+            return;
+        }
+        if (tunResult == TunSwitchResult.Denied)
+        {
+            NoticeManager.Instance.Enqueue("未获得管理员权限，TUN 模式未开启");
+        }
+
         if (await ConfigHandler.SaveConfig(_config) == 0)
         {
             await AutoStartupHandler.UpdateTask(_config);
             AppManager.Instance.Reset();
+            if (tunResult == TunSwitchResult.Applied)
+            {
+                // 已连接时内核按新的 TUN 设置重载；未连接时下次点「连接」生效
+                StatusBarViewModel.Instance.ReloadRequested.Publish();
+            }
 
             NoticeManager.Instance.Enqueue(needReboot ? ResUI.NeedRebootTips : ResUI.OperationSuccess);
             RequestClose?.Invoke(this, EventArgs.Empty);

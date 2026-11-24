@@ -1978,15 +1978,6 @@ namespace ServiceLib.Resx {
         }
         
         /// <summary>
-        ///   查找类似 The current node uses an unencrypted connection, meaning your communications could be directly monitored by network intermediaries controlled by authoritarian governments. For security reasons, nodes of this type cannot connect via Xray-core versions 26.2.6 or higher. If this is a self-built node, please enable TLS or other secure encryption, or pin the certificate using pinSHA256. If this is an airport/provider node, please contact your service provider for a technical upgrade. If the provider refuses to c [字符串的其余部分被截断]&quot;; 的本地化字符串。
-        /// </summary>
-        public static string MsgAllowInsecureDeprecated {
-            get {
-                return ResourceManager.GetString("MsgAllowInsecureDeprecated", resourceCulture);
-            }
-        }
-        
-        /// <summary>
         ///   查找类似 {0} has a new version available: {1} 的本地化字符串。
         /// </summary>
         public static string MsgCheckUpdateHasNewVersion {

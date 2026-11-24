@@ -706,12 +706,20 @@ public partial class MainWindowViewModel : MyReactiveObject
 
             await Task.Run(async () =>
             {
-                await LoadCore(allResult.MainResult.Context, allResult.PreSocksResult?.Context);
+                // 未连接时不加载内核：启动、断开状态下改设置只更新配置，点「连接」时才真正拉起内核
+                if (ServiceLib.Services.KeeperService.CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+                {
+                    await LoadCore(allResult.MainResult.Context, allResult.PreSocksResult?.Context);
+                }
                 await SysProxyHandler.UpdateSysProxy(_config, false);
                 await Task.Delay(1000);
             });
             RxSchedulers.MainThreadScheduler.Schedule(async () =>
             {
+                if (!ServiceLib.Services.KeeperService.CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+                {
+                    return; // 内核没在运行，不做连通测试（否则每次启动都会提示一次失败）
+                }
                 var result = await StatusBarViewModel.TestServerAvailability();
                 if (result == null || profileItem.IndexId.IsNullOrEmpty())
                 {

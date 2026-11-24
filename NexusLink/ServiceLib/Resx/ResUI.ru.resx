@@ -1794,9 +1794,6 @@
   <data name="menuNewUpdate" xml:space="preserve">
     <value>Доступно обновление</value>
   </data>
-  <data name="MsgAllowInsecureDeprecated" xml:space="preserve">
-    <value>Предупреждение: 1 августа 2026 г. Xray отключит пропуск проверки сертификата (allowInsecure). Как можно скорее перейдите на привязанный отпечаток сертификата (pinnedPeerCertSha256). После этой даты allowInsecure использовать будет нельзя</value>
-  </data>
   <data name="TbRouteExcludeAddress" xml:space="preserve">
     <value>Адреса, исключаемые из маршрутизации</value>
   </data>

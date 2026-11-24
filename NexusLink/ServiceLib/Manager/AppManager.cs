@@ -126,13 +126,17 @@ public sealed class AppManager
             Logging.SaveLog("AppExitAsync Begin");
 
             await SysProxyHandler.UpdateSysProxy(_config, true);
+            // 退出即未连接：落盘为未连接，下次启动不自动连上
+            _config.SystemProxyItem.SysProxyType = ConfigHandler.StartupSysProxyType(_config.SystemProxyItem.SysProxyType);
             AppEvents.AppExitRequested.Publish();
             await Task.Delay(50); //Wait for AppExitRequested to be processed
 
             await ConfigHandler.SaveConfig(_config);
             await ProfileExManager.Instance.SaveTo();
             await StatisticsManager.Instance.SaveTo();
+            KeeperService.Instance.Shutdown();
             await CoreManager.Instance.CoreStop();
+            CoreManager.Instance.KillLeftoverCores();
             StatisticsManager.Instance.Close();
 
             Logging.SaveLog("AppExitAsync End");

@@ -105,7 +105,7 @@
                                 HorizontalAlignment="Right"
                                 Background="Transparent"
                                 BorderBrush="Transparent"
-                                ToolTip="参数设置（含开机自启）">
+                                ToolTip="设置">
                                 <materialDesign:PackIcon
                                     Width="20"
                                     Height="20"
@@ -120,7 +120,7 @@
                                 BorderBrush="#6E6E6E"
                                 BorderThickness="1"
                                 CornerRadius="15"
-                                ToolTip="延迟：信号从你电脑到节点再回来的往返时间，越小越快。300 毫秒内显示绿色（快），800 以内橙色（一般），更慢显示红色">
+                                ToolTip="到节点的往返时间，越小越快">
                                 <TextBlock
                                     x:Name="DelayText"
                                     FontSize="13.5"
@@ -137,7 +137,7 @@
                                 BorderBrush="#6E6E6E"
                                 BorderThickness="1"
                                 CornerRadius="15"
-                                ToolTip="网速：每秒经过畅连节点的下载/上传数据量，只统计走代理的流量（右下角系统悬浮窗统计的是全电脑流量，是另一个软件的功能）">
+                                ToolTip="每秒经过畅连节点的下载 / 上传数据量">
                                 <TextBlock
                                     x:Name="SpeedText"
                                     FontSize="13.5"
@@ -197,7 +197,7 @@
                                 FontSize="11.5"
                                 Foreground="#A3A3A3"
                                 LineHeight="17"
-                                Text="真测速换血：通过两个 HTTPS 目标检测的节点才入池"
+                                Text="重新抓取节点，实测达标才进主池"
                                 TextWrapping="Wrap" />
                         </StackPanel>
                         <Button
@@ -240,7 +240,7 @@
                                 FontSize="11.5"
                                 Foreground="#A3A3A3"
                                 LineHeight="17"
-                                Text="线路变慢或断掉时，秒级跳到最快的那条"
+                                Text="线路断掉或变差时自动换线"
                                 TextWrapping="Wrap" />
                         </StackPanel>
                         <ToggleButton
@@ -282,7 +282,7 @@
                                 FontSize="11.5"
                                 Foreground="#A3A3A3"
                                 LineHeight="17"
-                                Text="按设置间隔自动更新节点"
+                                Text="定期更新节点并测速"
                                 TextWrapping="Wrap" />
                         </StackPanel>
                         <ToggleButton
@@ -302,7 +302,7 @@
                 Foreground="#B8B8B8"
                 LineHeight="18"
                 TextWrapping="Wrap"
-                Text="注意：线路列表中的节点来自公益节点池，由陌生志愿者提供，可能记录你访问了哪些网站。请勿在不信任的线路上登录网银、支付等敏感账号。弱加密、明文传输、跳过证书校验的节点已在加入前自动拦截，线路按安全性标注为高或中。" />
+                Text="线路来自公益节点池，由陌生人提供；请勿在不信任的线路上登录网银、支付等敏感账号" />
             <!-- ============ 3. 线路列表卡 ============ -->
             <Border
                 Background="#242424"

@@ -453,7 +453,7 @@
                 </ScrollViewer>
             </TabItem>
 
-            <TabItem Header="{x:Static resx:ResUI.TbCustomDnsRay}">
+            <TabItem Visibility="Collapsed" Header="{x:Static resx:ResUI.TbCustomDnsRay}">
                 <DockPanel Margin="{StaticResource Margin8}">
                     <Grid DockPanel.Dock="Top">
                         <Grid.RowDefinitions>

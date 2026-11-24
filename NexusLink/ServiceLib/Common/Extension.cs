@@ -144,9 +144,9 @@ public static class Extension
         [CallerLineNumber] int lineNumber = 0)
     {
         return Signal.Defer(() => interaction.Handle(input))
-            .Catch<TOutput, UnhandledInteractionException<TInput, TOutput>>(ex =>
+            .Catch<TOutput, UnhandledInteractionException<TInput, TOutput>>(_ =>
             {
-                Logging.SaveLog($"Unhandled interaction exception in {memberName} at {filePath}:{lineNumber}", ex);
+                // 没有视图注册这个交互 = 对应页面没加载（极简界面常态），属预期情况，不记日志
                 return Signal.Return(defaultValue);
             })
             .Catch<TOutput, Exception>(ex =>

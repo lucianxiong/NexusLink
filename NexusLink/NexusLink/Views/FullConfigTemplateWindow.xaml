@@ -39,7 +39,7 @@
         </StackPanel>
 
         <TabControl HorizontalContentAlignment="Left">
-            <TabItem HorizontalAlignment="Left" Header="{x:Static resx:ResUI.TbRayFullConfigTemplate}">
+            <TabItem HorizontalAlignment="Left" Visibility="Collapsed" Header="{x:Static resx:ResUI.TbRayFullConfigTemplate}">
                 <DockPanel Margin="{StaticResource Margin8}">
                     <Grid DockPanel.Dock="Top">
                         <Grid.RowDefinitions>

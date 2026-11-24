@@ -8,7 +8,7 @@ public partial class AddServer2Window
 
         Loaded += Window_Loaded;
 
-        cmbCoreType.ItemsSource = Utils.GetEnumNames<ECoreType>().Where(t => t != nameof(ECoreType.NexusLink)).ToList().AppendEmpty();
+        cmbCoreType.ItemsSource = Utils.GetEnumNames<ECoreType>().Where(t => t is nameof(ECoreType.sing_box) or nameof(ECoreType.mihomo)).ToList().AppendEmpty();
 
         this.WhenActivated(disposables =>
         {
@@ -46,7 +46,7 @@ public partial class AddServer2Window
         if (profileItem.ConfigType is EConfigType.Custom)
         {
             Title = ResUI.menuAddCustomServer;
-            cmbCoreType.ItemsSource = Utils.GetEnumNames<ECoreType>().Where(t => t != nameof(ECoreType.NexusLink)).ToList();
+            cmbCoreType.ItemsSource = Utils.GetEnumNames<ECoreType>().Where(t => t is nameof(ECoreType.sing_box) or nameof(ECoreType.mihomo)).ToList();
             gridCustomServer.Visibility = Visibility.Visible;
             gridCustomOutbound.Visibility = Visibility.Collapsed;
         }

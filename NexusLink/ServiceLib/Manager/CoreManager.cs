@@ -82,6 +82,8 @@ public class CoreManager
         await UpdateFunc(false, $"{node.GetSummary()}");
         await UpdateFunc(false, $"{Utils.GetRuntimeInfo()}");
         await UpdateFunc(false, string.Format(ResUI.StartService, DateTime.Now.ToString("yyyy/MM/dd HH:mm:ss")));
+        // 清掉上次异常退出留下的内核进程（只认本应用 bin 目录下的内核），不让残留占着端口
+        KillLeftoverCores();
         await CoreStop();
         await Task.Delay(100);
 
@@ -156,14 +158,16 @@ public class CoreManager
 
             if (_processService != null)
             {
-                await _processService.StopAsync();
+            ForgetChildProcess(_processService.Id);
+            await _processService.StopAsync();
                 _processService.Dispose();
                 _processService = null;
             }
 
             if (_processPreService != null)
             {
-                await _processPreService.StopAsync();
+            ForgetChildProcess(_processPreService.Id);
+            await _processPreService.StopAsync();
                 _processPreService.Dispose();
                 _processPreService = null;
             }
@@ -172,6 +176,85 @@ public class CoreManager
         {
             Logging.SaveLog(_tag, ex);
         }
+    }
+
+    // 当前是否有主内核进程在运行
+    public bool IsRunning => _processService is { HasExited: false };
+
+    private readonly HashSet<int> _childProcessIds = [];
+
+    // 登记本应用拉起的子进程：挂进同一个 Job（应用无论以何种方式退出，子进程一并结束），清扫残留时豁免
+    public void RegisterChildProcess(Process process)
+    {
+        lock (_childProcessIds)
+        {
+            _childProcessIds.Add(process.Id);
+        }
+        try
+        {
+            AddProcessJob(process.Handle);
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog(_tag, ex);
+        }
+    }
+
+    public void ForgetChildProcess(int processId)
+    {
+        lock (_childProcessIds)
+        {
+            _childProcessIds.Remove(processId);
+        }
+    }
+
+    // 清掉不属于当前进程的残留内核（上次异常退出 / 被强制结束后留下的 sing-box、mihomo 等）；
+    // 只处理本应用 bin 目录下的内核程序，不碰别的软件。返回清掉的进程数。
+    public int KillLeftoverCores()
+    {
+        var count = 0;
+        try
+        {
+            var binRoot = Path.GetFullPath(Utils.GetBinPath(string.Empty)).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            foreach (var name in new[] { "sing-box", "mihomo", "xray", "v2ray" })
+            {
+                foreach (var proc in Process.GetProcessesByName(name))
+                {
+                    try
+                    {
+                        bool mine;
+                        lock (_childProcessIds)
+                        {
+                            mine = _childProcessIds.Contains(proc.Id);
+                        }
+                        var exePath = string.Empty;
+                        try
+                        {
+                            exePath = proc.MainModule?.FileName ?? string.Empty;
+                        }
+                        catch
+                        {
+                        }
+                        if (mine || proc.HasExited || exePath.Length == 0
+                            || !Path.GetFullPath(exePath).StartsWith(binRoot, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+                        proc.Kill(true);
+                        count++;
+                        Logging.SaveLog($"CoreManager: leftover core process killed ({name} pid={proc.Id})");
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog(_tag, ex);
+        }
+        return count;
     }
 
     #region Private
@@ -358,6 +441,11 @@ public class CoreManager
             throw new Exception(ResUI.FailedToRunCore);
         }
         AddProcessJob(procService.Handle);
+        ForgetChildProcess(procService.Id);
+        lock (_childProcessIds)
+        {
+            _childProcessIds.Add(procService.Id);
+        }
 
         return procService;
     }

@@ -1773,9 +1773,6 @@ Tindakan "Ambil sertifikat" mungkin gagal jika sertifikat self-signed digunakan 
   <data name="menuNewUpdate" xml:space="preserve">
     <value>Pembaruan baru</value>
   </data>
-  <data name="MsgAllowInsecureDeprecated" xml:space="preserve">
-    <value>Peringatan: Xray akan menonaktifkan allowInsecure (lewati verifikasi sertifikat) pada Agustus 2026. Silakan beralih ke pinnedPeerCertSha256 (sidik jari sertifikat tetap) sesegera mungkin. allowInsecure tidak dapat digunakan setelah masa berlakunya berakhir.</value>
-  </data>
   <data name="TbRouteExcludeAddress" xml:space="preserve">
     <value>Alamat pengecualian rute</value>
   </data>

@@ -9,7 +9,7 @@ public partial class SubEditWindow
         Loaded += Window_Loaded;
 
         cmbConvertTarget.ItemsSource = Global.SubConvertTargets;
-        cmbCustomCoreType.ItemsSource = Utils.GetEnumNames<ECoreType>().Where(t => t != nameof(ECoreType.NexusLink)).ToList().AppendEmpty();
+        cmbCustomCoreType.ItemsSource = Utils.GetEnumNames<ECoreType>().Where(t => t is nameof(ECoreType.sing_box) or nameof(ECoreType.mihomo)).ToList().AppendEmpty();
 
         this.WhenActivated(disposables =>
         {

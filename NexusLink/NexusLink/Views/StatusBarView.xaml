@@ -109,59 +109,32 @@
             NoLeftClickDelay="True"
             ToolTipText="畅连">
             <tb:TaskbarIcon.ContextMenu>
-                <ContextMenu Style="{StaticResource DefContextMenu}">
+                <ContextMenu Style="{StaticResource DefContextMenu}" Opened="TrayMenu_Opened">
                     <MenuItem
-                        x:Name="menuSystemProxyClear"
+                        x:Name="menuTrayStatus"
                         Height="{StaticResource MenuItemHeight}"
-                        AutomationProperties.Name="{x:Static resx:ResUI.menuSystemProxyClear}">
-                        <MenuItem.Header>
-                            <StackPanel Orientation="Horizontal">
-                                <materialDesign:PackIcon
-                                    x:Name="menuSystemProxyClear2"
-                                    Margin="{StaticResource MarginRight8}"
-                                    VerticalAlignment="Center"
-                                    Kind="Check" />
-                                <TextBlock Text="{x:Static resx:ResUI.menuSystemProxyClear}" />
-                            </StackPanel>
-                        </MenuItem.Header>
-                    </MenuItem>
+                        Header="畅连"
+                        IsEnabled="False" />
+                    <Separator />
                     <MenuItem
-                        x:Name="menuSystemProxySet"
+                        x:Name="menuTrayConnect"
                         Height="{StaticResource MenuItemHeight}"
-                        AutomationProperties.Name="{x:Static resx:ResUI.menuSystemProxySet}">
-                        <MenuItem.Header>
-                            <StackPanel Orientation="Horizontal">
-                                <materialDesign:PackIcon
-                                    x:Name="menuSystemProxySet2"
-                                    Margin="{StaticResource MarginRight8}"
-                                    VerticalAlignment="Center"
-                                    Kind="Check" />
-                                <TextBlock Text="{x:Static resx:ResUI.menuSystemProxySet}" />
-                            </StackPanel>
-                        </MenuItem.Header>
-                    </MenuItem>
-                    
-                    
-                    
-                    <MenuItem Height="Auto" AutomationProperties.Name="{x:Static resx:ResUI.menuServers}">
-                        <MenuItem.Header>
-                            <DockPanel>
-                                <ComboBox
-                                    x:Name="cmbServers"
-                                    MaxWidth="300"
-                                    materialDesign:HintAssist.Hint="{x:Static resx:ResUI.menuServers}"
-                                    AutomationProperties.Name="{x:Static resx:ResUI.menuServers}"
-                                    DisplayMemberPath="Text"
-                                    FontSize="{DynamicResource StdFontSize}"
-                                    Style="{StaticResource MaterialDesignFilledComboBox}" />
-                            </DockPanel>
-                        </MenuItem.Header>
-                    </MenuItem>
-                    
-                    
-                    
-                    
-                    
+                        Header="立即连接"
+                        AutomationProperties.Name="连接或断开"
+                        Click="TrayConnect_Click" />
+                    <MenuItem
+                        x:Name="menuTrayRefresh"
+                        Height="{StaticResource MenuItemHeight}"
+                        Header="刷新与测速"
+                        AutomationProperties.Name="刷新与测速"
+                        Click="TrayRefresh_Click" />
+                    <MenuItem
+                        x:Name="menuTrayShowMain"
+                        Height="{StaticResource MenuItemHeight}"
+                        Header="打开畅连"
+                        AutomationProperties.Name="打开畅连"
+                        Click="TrayShowMain_Click" />
+                    <Separator />
                     <MenuItem
                         x:Name="menuExit"
                         Height="{StaticResource MenuItemHeight}"

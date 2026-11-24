@@ -193,7 +193,18 @@ public static class ConfigHandler
             config.SystemProxyItem.SystemProxyExceptions = Utils.IsWindows() ? Global.SystemProxyExceptionsWindows : Global.SystemProxyExceptionsLinux;
         }
 
+        // 每次启动一律未连接：「已连接」只是上次运行中的状态，不随下次启动恢复，点「连接」才连
+        config.SystemProxyItem.SysProxyType = StartupSysProxyType(config.SystemProxyItem.SysProxyType);
+
         return config;
+    }
+
+    /// <summary>
+    /// 启动与退出时的连接状态：恒为未连接。启动不自动连；退出后再打开同样未连接
+    /// </summary>
+    public static ESysProxyType StartupSysProxyType(ESysProxyType saved)
+    {
+        return ESysProxyType.ForcedClear;
     }
 
     /// <summary>

@@ -119,6 +119,12 @@ public class TaskManager
     {
         if (_config.GuiItem.AutoUpdateInterval > 0 && hours > 0 && hours % _config.GuiItem.AutoUpdateInterval == 0)
         {
+            // 分流规则经节点下载；未连接时内核已停，跳过本次，等下次触发
+            if (!ServiceLib.Services.KeeperService.Instance.IsConnected)
+            {
+                return;
+            }
+
             Logging.SaveLog("Execute update geo files");
 
             await new UpdateService(_config, async (success, msg) =>

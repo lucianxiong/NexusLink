@@ -545,6 +545,7 @@ public partial class CoreConfigSingboxService
             var strDNS = string.Empty;
             if (context.IsTunEnabled)
             {
+                // TUN 模板的境外 DNS 走 DoH（443）经节点查询：TCP/53 在部分线路上被限速或丢弃，实测解析超时
                 strDNS = string.IsNullOrEmpty(item?.TunDNS)
                     ? EmbedUtils.GetEmbedText(Global.TunSingboxDNSFileName)
                     : item?.TunDNS;

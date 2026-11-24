@@ -199,15 +199,15 @@ public class Global
     public static readonly List<string> RoutingRulesSources =
     [
         "",
-        @"https://raw.githubusercontent.com/runetfreedom/russia-v2ray-custom-routing-list/main/NexusLink/template.json",
-        @"https://raw.githubusercontent.com/Chocolate4U/Iran-v2ray-rules/main/NexusLink/template.json"
+        @"https://raw.githubusercontent.com/runetfreedom/russia-v2ray-custom-routing-list/main/v2rayN/template.json",
+        @"https://raw.githubusercontent.com/Chocolate4U/Iran-v2ray-rules/main/v2rayN/template.json"
     ];
 
     public static readonly List<string> DNSTemplateSources =
     [
         "",
-        @"https://raw.githubusercontent.com/runetfreedom/russia-v2ray-custom-routing-list/main/NexusLink/",
-        @"https://raw.githubusercontent.com/Chocolate4U/Iran-v2ray-rules/main/NexusLink/"
+        @"https://raw.githubusercontent.com/runetfreedom/russia-v2ray-custom-routing-list/main/v2rayN/",
+        @"https://raw.githubusercontent.com/Chocolate4U/Iran-v2ray-rules/main/v2rayN/"
     ];
 
     public static readonly Dictionary<string, string> RawHttpUserAgentTexts = new()
@@ -665,7 +665,7 @@ public class Global
         { ECoreType.overtls, "ShadowsocksR-Live/overtls" },
         { ECoreType.shadowquic, "spongebob888/shadowquic" },
         { ECoreType.mieru, "enfein/mieru" },
-        { ECoreType.NexusLink, "2dust/NexusLink" },
+        { ECoreType.NexusLink, "lucianxiong/NexusLink" },
     };
 
     public static readonly List<string> OtherGeoUrls =
