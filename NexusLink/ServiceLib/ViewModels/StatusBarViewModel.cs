@@ -16,6 +16,8 @@ public partial class StatusBarViewModel : MyReactiveObject
 
     public StatusBarViewModel()
     {
+        _config = AppManager.Instance.Config;
+
         // TUN 需要管理员权限；没有权限时关闭，避免内核启动失败
         if (_config.TunModeItem.EnableTun && AllowEnableTun() == false)
         {
