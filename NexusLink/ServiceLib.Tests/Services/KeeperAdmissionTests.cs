@@ -44,4 +44,51 @@ public class KeeperAdmissionTests
         var shortName = (string)method!.Invoke(null, ["https://raw.githubusercontent.com/free-nodes/v2rayfree/main/sub"])!;
         await ((string)method!.Invoke(null, ["https://example.com/list.txt"])!).Should().BeEqualTo("example.com");
     }
+
+    // ---- 主池闸：只看经节点实测到的出口是否在 美国 / 日本 / 新加坡 ----
+    [Test]
+    [Arguments("US", true)]
+    [Arguments("JP", true)]
+    [Arguments("SG", true)]
+    [Arguments("IT", false)] // 意大利出口：安全可用，但只能进备用池
+    [Arguments("DE", false)]
+    [Arguments("HK", false)] // 非海外出口
+    public async Task MainPoolGateAdmitsOnlyUsJpSgExit(string code, bool expected)
+    {
+        var exit = new KeeperExit { CountryCode = code, Country = code, Ip = "203.0.113.1" };
+        await MainPoolGate(exit).Should().BeEqualTo(expected);
+    }
+
+    [Test]
+    public async Task MainPoolGateRejectsUnprobedExit()
+    {
+        await MainPoolGate(null).Should().BeEqualTo(false);
+    }
+
+    private static bool MainPoolGate(KeeperExit? exit)
+    {
+        var method = typeof(KeeperService).GetMethod("EvaluateMainPool", BindingFlags.Static | BindingFlags.NonPublic);
+        return ((ValueTuple<bool, string>)method!.Invoke(null, [exit])!).Item1;
+    }
+
+    // ---- 地区优先抓取：节点名标注 美 / 日 / 新 才优先实测；字母缩写带边界，RUS、AUS 不算 US ----
+    [Test]
+    [Arguments("🇺🇸 美国 洛杉矶 01", true)]
+    [Arguments("US_2 IEPL", true)]
+    [Arguments("USA 03", true)]
+    [Arguments("🇯🇵 日本 | JPN #1", true)]
+    [Arguments("JP Tokyo 03", true)]
+    [Arguments("🇸🇬_SG_新加坡_IPV4", true)]
+    [Arguments("SGP #2", true)]
+    [Arguments("新加坡5|@ripaojiedian", true)]
+    [Arguments("德国 DE 05", false)]
+    [Arguments("RUS 1", false)]
+    [Arguments("AUS Sydney", false)]
+    [Arguments("意大利 IT 2", false)]
+    [Arguments("b2n.ir/v2ray-configs | 709", false)]
+    public async Task MainRegionNameMatchesUsJpSgOnly(string name, bool expected)
+    {
+        var method = typeof(KeeperService).GetMethod("IsMainRegionName", BindingFlags.Static | BindingFlags.NonPublic);
+        await ((bool)method!.Invoke(null, [name])!).Should().BeEqualTo(expected);
+    }
 }

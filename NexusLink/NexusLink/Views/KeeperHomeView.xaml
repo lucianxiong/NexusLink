@@ -185,7 +185,7 @@
                                 <ComboBoxItem Content="800 毫秒"/>
                                 <ComboBoxItem Content="1200 毫秒"/>
                             </ComboBox>
-                            <TextBlock Text="实测延迟高于上限的节点不进主池，只留作备用。选路顺序：安全 &gt; 稳定 &gt; 带宽 &gt; 延迟，在用的节点只要没问题就不换" Style="{StaticResource Muted}" Margin="0,7,0,0"/>
+                            <TextBlock Text="主池只收实测出口在美国、日本、新加坡的节点，其余安全可用节点留作备用；主池为空时自动改用备用线路。延迟上限只影响自动选路的顺序：安全 &gt; 稳定 &gt; 带宽 &gt; 延迟，在用的节点只要没问题就不换" Style="{StaticResource Muted}" Margin="0,7,0,0"/>
                         </StackPanel>
                     </Border>
                 </StackPanel>

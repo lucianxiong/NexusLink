@@ -1,7 +1,7 @@
 <Project>
 
     <PropertyGroup>
-        <Version>2.1.0</Version>
+        <Version>2.2.0</Version>
         <Product>畅连</Product>
         <AssemblyTitle>畅连</AssemblyTitle>
         <Description>畅连 NexusLink - Windows proxy client with built-in node keeper</Description>

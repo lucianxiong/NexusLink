@@ -11,13 +11,14 @@ namespace ServiceLib.Services;
 
 /// <summary>
 /// 畅连内置节点管家（NexusLink Keeper）：
-/// 换血 = mihomo 分层池管线：抓全球公益池 → TCP 预筛 → mihomo 真测速(Google 204) →
-///   隔离晋升（连续可用且 &lt;800ms）进 Primary-Pool（高质量）→ 其余进 Backup-Pool（备用）；
-///   分层结果落盘为 quality.yaml / backup.yaml（仅留档，mihomo 兜底接管已移除）。
-///   Top3 高质量节点导入畅连主池（sing-box 原生策略组）。
-/// 守卫 = 启动防抖（核心就绪+宽限期内不判定）+ 滑动窗口迟滞（连续 N 次 bad 才动作）+
-///   池内换线（按 安全 > 稳定 > 带宽 > 延迟 重选，支持手动指定，不全量换血）+
-///   告警（备用池也全垃圾时保留现有连接并告警）。
+/// 换血 = 深度抓取 → 安全审查 → TCP 预筛 → mihomo 真测速，Google 与 Cloudflare 两个目标 → 实测出口归属 →
+///   主池 = 实测出口在 美国 / 日本 / 新加坡 的安全可用节点，不卡延迟；
+///   备用池 = 其余通过安全审查的实测可用节点，不限地区与延迟；
+///   主池为空时用延迟最低的备用节点顶上，界面如实标注「当前使用备用线路」。
+///   分层结果落盘为 quality.yaml / backup.yaml，仅留档；池成员由 sing-box 原生策略组承载。
+/// 守卫 = 启动防抖，核心就绪加宽限期内不判定 + 滑动窗口迟滞，连续 N 次 bad 才动作 +
+///   池内换线，按 安全 > 稳定 > 带宽 > 延迟 重选，支持手动指定，不全量换血 +
+///   告警，一个可用节点都没有时保留现有连接并告警。
 /// </summary>
 public sealed class KeeperService
 {
@@ -131,8 +132,10 @@ public sealed class KeeperService
         if (State.Enabled)
         {
             var items = await AppManager.Instance.ProfileItems(SubId);
-            if (items == null || items.Count < 3)
+            if (items == null || items.Count < 3 || State.PolicyVersion < CurrentPolicyVersion)
             {
+                State.PolicyVersion = CurrentPolicyVersion;
+                SaveState();
                 _ = RefreshAsync();
             }
         }
@@ -490,12 +493,17 @@ public sealed class KeeperService
     private string _selectorWanted = string.Empty;  // 最近一次成功下发给内核的目标
     private DateTime _lastGroupTestAt = DateTime.MinValue;
     private bool _adoptionDone;                     // 首次轮询时把用户手选的单节点转成手动指定（只做一次）
-    private const int ExitProbeMax = 16;            // 每轮换血最多查询这么多个节点的出口归属
+    private const int ExitProbeMax = 60;            // 每轮换血最多查询这么多个节点的出口归属；主池按实测出口分地区，要覆盖真测速存活的节点
     private const int SpeedProbeMax = 10;            // 其中前这么多个顺带实测下行带宽
+    private const int RegionCandidateMax = 150;      // 名称命中 美 / 日 / 新 的候选上限，地区优先、深度抓取
+    private const int MainTestCap = 120;             // 地区候选进入 mihomo 真测速的上限
+    private const int OtherTestCap = 40;             // 其余候选进入真测速的上限，为备用池提供实测数据
+    private const int BackupImportMax = 20;          // 主池为空时导入备用节点的上限
+    private const int CurrentPolicyVersion = 2;      // 准入规则版本：2 = 主池只收实测出口在 美 / 日 / 新 的节点
     private const int SpeedProbeSeconds = 5;         // 单个节点带宽实测的最长时间
     private const string SpeedProbeUrl = "https://speed.cloudflare.com/__down?bytes=50000000";
 
-    // 主池延迟上限：不高于隔离门槛，也不高于用户设置的 MaxLatencyMs
+    // 自动选路偏好：优先选实测延迟低于此值的节点，不高于隔离门槛；主池准入只看实测出口，不看延迟
     private int MainLatencyLimit => Math.Min(State.QuarantineMaxLatencyMs, Math.Clamp(State.MaxLatencyMs, 200, 3000));
 
     // 非海外出口 = 中国大陆及港澳台（规则：节点只能是海外安全节点）
@@ -897,7 +905,7 @@ public sealed class KeeperService
                 {
                     continue; // 本轮组测速未覆盖
                 }
-                if (d > State.DegradeLatencyMs)
+                if (d > State.DegradeLatencyMs && !State.ServingBackup)
                 {
                     State.DegradeMap[it.Remarks] = State.DegradeMap.GetValueOrDefault(it.Remarks) + 1;
                     if (State.DegradeMap[it.Remarks] >= State.DegradeRounds)
@@ -974,6 +982,34 @@ public sealed class KeeperService
         ("芬兰", "FI"), ("FI", "FI"), ("澳大利亚", "AU"), ("AU", "AU"), ("马来", "MY"), ("MY", "MY"),
         ("泰国", "TH"), ("TH", "TH"), ("越南", "VN"), ("VN", "VN"), ("菲律宾", "PH"), ("PH", "PH"),
     ];
+
+    // ---- 主池地区：美国 / 日本 / 新加坡 ----
+    // 以实测出口为准，EvaluateMainPool 是唯一门槛；节点名命中只用来决定抓取与测速的优先级
+    internal static readonly HashSet<string> MainRegionCodes = new(StringComparer.Ordinal) { "US", "JP", "SG" };
+    private static readonly System.Text.RegularExpressions.Regex MainRegionNameRx = new(
+        @"美国|(?<![A-Za-z])USA?(?![A-Za-z])|United\s*States|洛杉矶|圣何塞|硅谷|西雅图|凤凰城|芝加哥|达拉斯|纽约"
+        + @"|日本|(?<![A-Za-z])JPN?(?![A-Za-z])|Japan|Tokyo|Osaka"
+        + @"|新加坡|(?<![A-Za-z])SGP?(?![A-Za-z])|Singapore|狮城|🇺🇸|🇯🇵|🇸🇬",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // 节点池原名是否标注了 美 / 日 / 新；字母缩写带边界，RUS、AUS 之类不算 US
+    internal static bool IsMainRegionName(string? name)
+        => name.IsNotEmpty() && MainRegionNameRx.IsMatch(name);
+
+    // 主池准入：只看经节点实测到的出口是否在 美国 / 日本 / 新加坡。
+    // 安全等级由候选闸前置把关，弱加密 / 明文 / 跳过证书校验的节点不会走到这里；可用性由双目标真测速保证。
+    internal static (bool Ok, string Reason) EvaluateMainPool(KeeperExit? exit)
+    {
+        if (exit == null || exit.CountryCode.Length != 2)
+        {
+            return (false, "出口未探测");
+        }
+        if (!MainRegionCodes.Contains(exit.CountryCode))
+        {
+            return (false, $"实测出口在{ZhCountry.GetValueOrDefault(exit.CountryCode, exit.CountryCode)}，不在 美国 / 日本 / 新加坡");
+        }
+        return (true, $"实测出口 {ZhCountry.GetValueOrDefault(exit.CountryCode, exit.CountryCode)}");
+    }
 
     // 稳定评级（只用可核对的记录）：出现天数 + 最近实测通过率。记录不足 1 天的证明不了稳定，按「低」计。
     internal static (string Level, string Reason) EvaluateStability(KeeperQuality? quality, DateTime now)
@@ -1077,8 +1113,13 @@ public sealed class KeeperService
             }));
             var poolsOk = catalogs.Count(catalog => catalog.Length > 0);
             State.ReachableSources = poolsOk;
+            // 选样（地区优先，深度抓取）：名称命中 美国 / 日本 / 新加坡 的安全候选全部保留，
+            // 其余节点按来源轮转补齐到 MaxCandidates——大池子不再被均匀截断，美 / 日 / 新候选先吃预算
+            var regionLinks = new List<string>();
+            var otherLinks = new List<string>();
+            var regionSet = new HashSet<string>(StringComparer.Ordinal);
             var maxLength = catalogs.Select(catalog => catalog.Length).DefaultIfEmpty().Max();
-            for (var i = 0; i < maxLength && links.Count < State.MaxCandidates; i++)
+            for (var i = 0; i < maxLength; i++)
             {
                 for (var ci = 0; ci < catalogs.Length; ci++)
                 {
@@ -1095,20 +1136,37 @@ public sealed class KeeperService
                         continue;
                     }
                     var identity = JsonSerializer.Serialize(proxy.Where(entry => entry.Key != "name").OrderBy(entry => entry.Key));
-                    if (seen.Add(identity))
+                    if (!seen.Add(identity))
                     {
-                        links.Add(link);
-                        var sourceHp = ParseHostPort(link);
-                        if (sourceHp != null)
-                        {
-                            sourceByHostPort[$"{sourceHp.Value.host.ToLowerInvariant()}:{sourceHp.Value.port}"] = PoolShortName(poolUrls[ci]);
-                        }
+                        continue;
                     }
-                    if (links.Count >= State.MaxCandidates)
+                    if (proxy.TryGetValue("name", out var nodeName) && nodeName is string nodeText && IsMainRegionName(nodeText))
                     {
-                        break;
+                        regionLinks.Add(link);
+                    }
+                    else
+                    {
+                        otherLinks.Add(link);
+                    }
+                    var sourceHp = ParseHostPort(link);
+                    if (sourceHp != null)
+                    {
+                        sourceByHostPort[$"{sourceHp.Value.host.ToLowerInvariant()}:{sourceHp.Value.port}"] = PoolShortName(poolUrls[ci]);
                     }
                 }
+            }
+            foreach (var link in regionLinks.Take(RegionCandidateMax))
+            {
+                links.Add(link);
+                regionSet.Add(link);
+            }
+            foreach (var link in otherLinks)
+            {
+                if (links.Count >= State.MaxCandidates)
+                {
+                    break;
+                }
+                links.Add(link);
             }
             var rejectedTotal = rejectedReasons.Values.Sum();
             var rejectedSummary = string.Join("、", rejectedReasons.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key} {kv.Value}"));
@@ -1119,21 +1177,20 @@ public sealed class KeeperService
                 Rejected = rejectedTotal,
                 Reasons = rejectedSummary,
             };
-            Logging.SaveLog($"KeeperService security audit: poolsOk={poolsOk}/{poolUrls.Count} candidates={links.Count} rejected={rejectedTotal}{(rejectedTotal > 0 ? $" ({rejectedSummary})" : string.Empty)} minSecurity={State.MinSecurity}");
+            Logging.SaveLog($"KeeperService security audit: poolsOk={poolsOk}/{poolUrls.Count} candidates={links.Count} region={Math.Min(regionLinks.Count, RegionCandidateMax)} rejected={rejectedTotal}{(rejectedTotal > 0 ? $" ({rejectedSummary})" : string.Empty)}");
             if (links.Count < State.MinAlive)
             {
                 Logging.SaveLog($"KeeperService refresh FAILED: poolsOk={poolsOk}/{State.Pools.Count} links={links.Count} (insufficient)");
                 NoticeManager.Instance.SendMessage($"畅连管家：本轮池子未取到足够节点（{links.Count}），保持原线路不变");
                 return false;
             }
-
             // 2. TCP prefilter (parallel, 3s) — 只做廉价的初筛，绝不做质量判定
             RefreshStatus = rejectedTotal > 0
                 ? $"正在检查 {links.Count} 个节点的端口 · 已拦截 {rejectedTotal} 个不安全节点"
                 : $"正在检查 {links.Count} 个节点的端口";
-            var alive = new ConcurrentBag<(int rtt, string link)>();
-            using var sem = new SemaphoreSlim(16);
-            var tasks = links.Take(State.MaxCandidates).Select(async link =>
+            var alive = new ConcurrentBag<(int rtt, string link, bool region)>();
+            using var sem = new SemaphoreSlim(32);
+            var tasks = links.Select(async link =>
             {
                 await sem.WaitAsync();
                 try
@@ -1142,7 +1199,7 @@ public sealed class KeeperService
                     var rtt = await TcpPingAsync(hp.Value.host, hp.Value.port);
                     if (rtt >= 0)
                     {
-                        alive.Add((rtt, link));
+                        alive.Add((rtt, link, regionSet.Contains(link)));
                     }
                 }
                 catch { }
@@ -1152,7 +1209,12 @@ public sealed class KeeperService
                 }
             });
             await Task.WhenAll(tasks);
-            var candidates = alive.OrderBy(t => t.rtt).Take(60).ToList();
+            // 地区候选只要 TCP 可达就全部进真测速（上限 MainTestCap），其余取延迟最低的补到预算——深度留给 美 / 日 / 新
+            var candidates = alive.Where(t => t.region).OrderBy(t => t.rtt).Take(MainTestCap)
+                .Concat(alive.Where(t => !t.region).OrderBy(t => t.rtt).Take(OtherTestCap))
+                .OrderBy(t => t.rtt)
+                .Select(t => (t.rtt, t.link))
+                .ToList();
             if (candidates.Count < State.MinAlive)
             {
                 Logging.SaveLog($"KeeperService refresh FAILED: links={links.Count} tcpAlive={candidates.Count} poolsOk={poolsOk} (too few alive)");
@@ -1313,37 +1375,40 @@ public sealed class KeeperService
                 .ToDictionary();
             SaveState();
             var aliveForGoogle = testMap.Where(kv => kv.Value > 0).OrderBy(kv => kv.Value).ToList();
-            var quarantined = aliveForGoogle.Where(kv => kv.Value < MainLatencyLimit).ToList();
-            Logging.SaveLog($"KeeperService refresh: tested={parsed.Count} dualTargetAlive={aliveForGoogle.Count} mainPoolPass={quarantined.Count} latencyCap={MainLatencyLimit}ms overCap={aliveForGoogle.Count - quarantined.Count}");
+            Logging.SaveLog($"KeeperService refresh: tested={parsed.Count} dualTargetAlive={aliveForGoogle.Count} latencyCap={MainLatencyLimit}ms");
             var delaySample = string.Join("  ", aliveForGoogle.Take(8).Select(kv => $"{(kv.Key.Length > 18 ? kv.Key[..18] : kv.Key)}={kv.Value}ms"));
             Logging.SaveLog($"KeeperService refresh: delays {delaySample}");
             if (aliveForGoogle.Count < 1)
             {
-                NoticeManager.Instance.SendMessage($"畅连管家：⚠️ 本轮 {parsed.Count} 个节点无一通过真测速（免费池高峰期常见），保留现有连接（告警）");
+                NoticeManager.Instance.SendMessage($"畅连管家：⚠️ 本轮 {parsed.Count} 个节点无一通过真测速，免费池高峰期常见，保留现有连接");
                 Logging.SaveLog("KeeperService refresh FAILED: no node passed both HTTPS targets — keep current connection (ALARM)");
                 return false;
             }
-
-            // 4. 隔离晋升：实测延迟低于上限（MaxLatencyMs，默认 800ms）的进 quality.yaml（Primary-Pool 专用），其余活节点留 backup.yaml
+            // 4. 主池闸：实测出口在 美国 / 日本 / 新加坡 → 主池；其余实测可用的安全节点全部进备用池。
+            //    不卡延迟：能走到这里的都已通过双目标真测速，安全等级在候选闸已把关。
             var qualityProxies = new List<Dictionary<string, object?>>();
             var qualityLinks = new List<string>();
             var backupProxies = new List<Dictionary<string, object?>>();
+            var backupLinks = new List<string>();
             var nameByName = parsed.ToDictionary(t => (string)t.proxy["name"]!, t => t);
+            var gateBuckets = new Dictionary<string, int>();
             foreach (var (name, delay) in aliveForGoogle)
             {
                 if (!nameByName.TryGetValue(name, out var hit))
                 {
                     continue;
                 }
-                if (delay < MainLatencyLimit)
+                var (admitted, reason) = EvaluateMainPool(exits.GetValueOrDefault(name));
+                if (admitted)
                 {
                     qualityProxies.Add(hit.proxy);
                     qualityLinks.Add(hit.link);
+                    continue;
                 }
-                else
-                {
-                    backupProxies.Add(hit.proxy);
-                }
+                backupProxies.Add(hit.proxy);
+                backupLinks.Add(hit.link);
+                var bucket = reason.StartsWith("实测出口在", StringComparison.Ordinal) ? "出口不在美日新" : "出口未探测";
+                gateBuckets[bucket] = gateBuckets.GetValueOrDefault(bucket) + 1;
             }
             foreach (var (name, _) in aliveForGoogle.Where(kv => !nameByName.ContainsKey(kv.Key)).ToList())
             {
@@ -1364,97 +1429,71 @@ public sealed class KeeperService
                     Stability = EvaluateStability(State.QualityHistory.GetValueOrDefault(GetQualityKey(item)), DateTime.Now).Level,
                 })
                 .ToList();
-            if (qualityProxies.Count == 0)
+            if (qualityProxies.Count > 0)
             {
-                // 新节点一个都没达标，也不能跳过池内复审：不安全 / 非海外的旧节点照样清掉，否则会一直留在池里被选中
-                var evictedWhileRetained = await AuditExistingPoolAsync();
-                if (evictedWhileRetained > 0)
-                {
-                    State.Nodes = BuildNodes(await AppManager.Instance.ProfileItems(SubId) ?? []);
-                    if (_config.IndexId == GroupIndexId && _reloadFunc != null)
-                    {
-                        Logging.SaveLog($"KeeperService: pool membership changed (-{evictedWhileRetained}), reloading core");
-                        await _reloadFunc();
-                    }
-                }
-                await File.WriteAllTextAsync(Path.Combine(WorkDir, "backup.yaml"), BuildClashYaml(backupProxies));
-                State.BackupCount = backupProxies.Count;
-                State.BackupNodes = backupNodes;
-                State.Tested = parsed.Count;
-                State.LastRefresh = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                _lastRefreshAt = DateTime.Now;
-                SaveState();
-                RefreshStatus = $"刷新完成 · 保留主池，更新 {backupProxies.Count} 个备用节点";
-                Logging.SaveLog($"KeeperService refresh: backup-only result count={backupProxies.Count}; retained previous primary pool");
-                return true;
+                await File.WriteAllTextAsync(Path.Combine(WorkDir, "quality.yaml"), BuildClashYaml(qualityProxies));
             }
-            await File.WriteAllTextAsync(Path.Combine(WorkDir, "quality.yaml"), BuildClashYaml(qualityProxies));
             await File.WriteAllTextAsync(Path.Combine(WorkDir, "backup.yaml"), BuildClashYaml(backupProxies));
-            Logging.SaveLog($"KeeperService refresh: pools written quality={qualityProxies.Count} backup={backupProxies.Count}");
-
-            // 5. 增量准入（默认）：不盲目替换旧池——只补目标带内空位，地区分散优先；
+            Logging.SaveLog($"KeeperService refresh: pools written quality={qualityProxies.Count} backup={backupProxies.Count} gate={string.Join(",", gateBuckets.Select(kv => kv.Key + "=" + kv.Value))}");
+            State.QualityLinks = qualityLinks;
+            State.ServingBackup = qualityProxies.Count == 0;
+            // 5. 入池集合 = 本轮达标节点：主池优先；主池为空时用延迟最低的备用节点顶上，界面标注「当前使用备用线路」。
+            //    池成员只认本轮结果，不再达标的旧节点移出；安全复审仍由 AuditExistingPoolAsync 把关。
             await EnsureSubItemAsync();
-            var existing = await AppManager.Instance.ProfileItems(SubId) ?? [];
-            var inPool = existing.Select(t => $"{t.Address.ToLowerInvariant()}:{t.Port}").ToHashSet();
-            var target = Math.Max(State.PoolMinMain, Math.Min(State.PoolMaxMain, Math.Max(existing.Count, State.PoolMinMain)));
-            var slots = Math.Max(0, target - existing.Count);
-            var regionCount = new Dictionary<string, int>();
-            foreach (var it in existing)
+            string? HpKeyOf(string link)
             {
-                var rg0 = RegionOf(it.Remarks);
-                regionCount[rg0] = regionCount.GetValueOrDefault(rg0) + 1;
-            }
-            var regionCap = (int)Math.Ceiling(target * 0.4);
-            // 实测出口在中国大陆或港澳台的节点不进池（名称闸漏网的，这里按出口归属把关）
-            var nonOverseasLinks = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var link in qualityLinks)
-            {
-                if (FmtHandler.ResolveConfig(link, out _) is { } exitCandidate && IsNonOverseasExit(exitCandidate))
-                {
-                    nonOverseasLinks.Add(link);
-                }
-            }
-            if (nonOverseasLinks.Count > 0)
-            {
-                Logging.SaveLog($"KeeperService: skipped {nonOverseasLinks.Count} non-overseas exit nodes (exit in CN/HK/MO/TW)");
-            }
-            var importLinks = new List<string>();
-            foreach (var link in qualityLinks)
-            {
-                if (importLinks.Count >= slots)
-                {
-                    break;
-                }
                 var hp = ParseHostPort(link);
-                if (hp == null || nonOverseasLinks.Contains(link) || inPool.Contains($"{hp.Value.host.ToLowerInvariant()}:{hp.Value.port}"))
+                return hp == null ? null : $"{hp.Value.host.ToLowerInvariant()}:{hp.Value.port}";
+            }
+            IEnumerable<string> serveLinks = State.ServingBackup ? backupLinks.Take(BackupImportMax) : qualityLinks;
+            var serveSet = new List<string>();
+            var serveHp = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var link in serveLinks)
+            {
+                // 实测出口在中国大陆或港澳台的节点不进池，名称闸漏网的按出口归属把关
+                if (FmtHandler.ResolveConfig(link, out _) is { } exitCandidate && IsNonOverseasExit(exitCandidate))
                 {
                     continue;
                 }
-                var region = RegionOf(link);
-                if (region != "OTHER" && regionCount.GetValueOrDefault(region) >= regionCap)
+                var key = HpKeyOf(link);
+                if (key == null)
                 {
-                    continue; // 同地区占比 ≤ 40%，防单地区全军覆没
+                    continue;
                 }
-                regionCount[region] = regionCount.GetValueOrDefault(region) + 1;
-                importLinks.Add(link);
+                serveSet.Add(link);
+                serveHp.Add(key);
             }
-            var count = importLinks.Count > 0
-                ? await ConfigHandler.AddBatchServers(_config, string.Join(Environment.NewLine, importLinks), SubId, false)
-                : Math.Max(existing.Count, 1);
-            if (count < 1)
+            if (serveSet.Count == 0)
             {
-                Logging.SaveLog("KeeperService refresh FAILED: import returned 0");
-                NoticeManager.Instance.SendMessage("畅连管家：节点导入失败，保持原线路不变");
+                Logging.SaveLog($"KeeperService refresh FAILED: no importable node (main={qualityProxies.Count} backup={backupProxies.Count}, all non-overseas)");
+                NoticeManager.Instance.SendMessage("畅连管家：本轮没有可导入的节点，保持原线路不变");
                 return false;
             }
-            State.QualityLinks = qualityLinks;
-
-            // 7. security filter：池内已有节点按同一口径复审（老版本放进来的、链接被改过的），不合规的一律出池
+            var existing = await AppManager.Instance.ProfileItems(SubId) ?? [];
+            var inPool = existing.Select(t => $"{t.Address.ToLowerInvariant()}:{t.Port}").ToHashSet();
+            var importLinks = serveSet.Where(link => !inPool.Contains(HpKeyOf(link)!)).ToList();
+            var stale = existing.Where(t => !serveHp.Contains($"{t.Address.ToLowerInvariant()}:{t.Port}")).ToList();
+            if (importLinks.Count > 0)
+            {
+                var count = await ConfigHandler.AddBatchServers(_config, string.Join(Environment.NewLine, importLinks), SubId, false);
+                if (count < 1)
+                {
+                    Logging.SaveLog("KeeperService refresh FAILED: import returned 0");
+                    NoticeManager.Instance.SendMessage("畅连管家：节点导入失败，保持原线路不变");
+                    return false;
+                }
+            }
+            if (stale.Count > 0)
+            {
+                await ConfigHandler.RemoveServers(_config, stale);
+                Logging.SaveLog($"KeeperService: evicted {stale.Count} pool nodes outside the current qualified set");
+            }
+            // 6. security filter：池内已有节点按同一口径复审，老版本放进来的、链接被改过的，不合规的一律出池
             var evictedCount = await AuditExistingPoolAsync();
             var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
-
-            // 8. policy group + active
+            // 7. policy group + active
             await EnsureGroupAsync();
+            var membershipChanged = importLinks.Count > 0 || stale.Count > 0 || evictedCount > 0;
             if (_config.IndexId.IsNullOrEmpty() && items.Count > 0)
             {
                 await ApplyActiveAsync(items);
@@ -1463,15 +1502,14 @@ public sealed class KeeperService
                     await _reloadFunc();
                 }
             }
-            else if (_config.IndexId == GroupIndexId && (importLinks.Count > 0 || evictedCount > 0) && _reloadFunc != null)
+            else if (_config.IndexId == GroupIndexId && membershipChanged && _reloadFunc != null)
             {
-                // 策略组按订阅筛选条件动态取成员：新节点入池、或不安全节点被剔除后，
-                // 必须重载内核，运行中的配置才会跟着变（否则要等下次切线或重启才生效）。
-                Logging.SaveLog($"KeeperService: pool membership changed (+{importLinks.Count} / -{evictedCount}), reloading core");
+                // 策略组按订阅筛选条件动态取成员：新节点入池、或不达标 / 不安全节点被剔除后，
+                // 必须重载内核，运行中的配置才会跟着变，否则要等下次切线或重启才生效。
+                Logging.SaveLog($"KeeperService: pool membership changed (+{importLinks.Count} / -{stale.Count + evictedCount}), reloading core");
                 await _reloadFunc();
             }
-
-            // 8b. 选路：内核重载后选择器会复位，重新按策略应用（手动指定 > 自动优选）
+            // 7b. 选路：内核重载后选择器会复位，重新按策略应用，手动指定 > 自动优选
             if (_coreApiOk)
             {
                 for (var attempt = 0; attempt < 4 && !await ApplySelectionAsync(); attempt++)
@@ -1479,8 +1517,7 @@ public sealed class KeeperService
                     await Task.Delay(1500);
                 }
             }
-
-            // 9. state + reload
+            // 8. state
             State.LastRefresh = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             _lastRefreshAt = DateTime.Now;
             State.LastAlive = items.Count;
@@ -1489,12 +1526,18 @@ public sealed class KeeperService
             State.BackupCount = backupProxies.Count;
             State.BackupNodes = backupNodes;
             SaveState();
-            RefreshStatus = State.SecurityAudit.Rejected > 0
-                ? $"刷新完成 · 已测速 {parsed.Count} 个节点 · 拦截 {State.SecurityAudit.Rejected} 个不安全节点"
-                : $"刷新完成 · 已测速 {parsed.Count} 个节点";
-
-            NoticeManager.Instance.SendMessage($"畅连管家：换血完成——实测 {parsed.Count} 个节点，{qualityProxies.Count} 个达标进入主池，{backupProxies.Count} 个留作备用，拦截 {State.SecurityAudit.Rejected} 个不安全节点");
-            Logging.SaveLog($"KeeperService refreshed: tested={parsed.Count} pool={items.Count} quality={qualityProxies.Count} backup={backupProxies.Count} rejected={State.SecurityAudit.Rejected} evicted={evictedCount} exits={State.Exits.Count} latencyCap={MainLatencyLimit}ms");
+            var rejectedLine = State.SecurityAudit.Rejected > 0 ? $" · 拦截 {State.SecurityAudit.Rejected} 个不安全节点" : string.Empty;
+            if (State.ServingBackup)
+            {
+                RefreshStatus = $"刷新完成 · 本轮没有 美国 / 日本 / 新加坡 达标节点，已启用 {items.Count} 条备用线路" + rejectedLine;
+                NoticeManager.Instance.SendMessage($"畅连管家：换血完成——实测 {parsed.Count} 个节点，主池暂无 美 / 日 / 新 达标节点，已用 {items.Count} 条备用线路顶上{rejectedLine}");
+            }
+            else
+            {
+                RefreshStatus = $"刷新完成 · 已测速 {parsed.Count} 个节点 · {qualityProxies.Count} 条进入主池" + rejectedLine;
+                NoticeManager.Instance.SendMessage($"畅连管家：换血完成——实测 {parsed.Count} 个节点，{qualityProxies.Count} 条进入主池，{backupProxies.Count} 条留作备用{rejectedLine}");
+            }
+            Logging.SaveLog($"KeeperService refreshed: tested={parsed.Count} pool={items.Count} quality={qualityProxies.Count} backup={backupProxies.Count} servingBackup={State.ServingBackup} rejected={State.SecurityAudit.Rejected}");
             return true;
         }
         catch (Exception ex)
@@ -2839,6 +2882,15 @@ public sealed class KeeperService
         State.BackupNodes ??= [];
         State.QualityLinks ??= [];
         _minSecurityRank = Math.Max(1, SecurityRank(State.MinSecurity));
+
+        // 版本新增的节点来源合并进已保存配置：keeper.json 里的旧来源清单不知道新源
+        foreach (var url in new KeeperState().Pools)
+        {
+            if (!State.Pools.Contains(url))
+            {
+                State.Pools.Add(url);
+            }
+        }
     }
 
     // 主文件读不出来时，用上一次保存前的快照（keeper.json.bak）顶上，历史不丢
@@ -2915,6 +2967,7 @@ public class KeeperState
 
     public List<string> Pools { get; set; } =
     [
+    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
         "https://raw.githubusercontent.com/free-nodes/v2rayfree/main/sub",
         "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
         "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
@@ -2949,7 +3002,7 @@ public class KeeperState
     public string MinSecurity { get; set; } = "中"; // 注入门槛：中 = 放行「中」「高」；高 = 只放行「高」；「低」无论如何都拦截
 
     // ---- 选路与准入 ----
-    public int MaxLatencyMs { get; set; } = 1200;             // 主池延迟上限：实测延迟高于此值的不进主池（只留作备用）；默认 1200，可用节点更多
+    public int MaxLatencyMs { get; set; } = 1200;             // 自动选路偏好：优先选实测延迟低于此值的节点；主池准入只看实测出口，不按延迟卡
     public string PinnedIndexId { get; set; } = string.Empty; // 手动指定的节点（IndexId）；为空 = 自动选路
     public string PinnedRemarks { get; set; } = string.Empty;
     public string ActiveIndexId { get; set; } = string.Empty; // 内核当前实际在用的节点
@@ -2965,6 +3018,8 @@ public class KeeperState
     public int ReachableSources { get; set; }
     public int BackupCount { get; set; }
     public List<KeeperNode> BackupNodes { get; set; } = [];
+    public bool ServingBackup { get; set; }             // 主池为空、正在用备用线路顶上，界面据此标注
+    public int PolicyVersion { get; set; }               // 已应用的准入规则版本，低于当前版本时启动后自动重新换血
     public Dictionary<string, KeeperQuality> QualityHistory { get; set; } = [];
     public int LastAlive { get; set; }
     public int Tested { get; set; }

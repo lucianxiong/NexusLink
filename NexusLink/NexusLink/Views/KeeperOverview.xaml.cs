@@ -165,7 +165,7 @@ public partial class KeeperOverview
 
         // ---- 线路 ----
         BtnConnect.Style = (Style)FindResource(sysOn ? "BtnAccent" : "BtnPrimary");
-        CountBadge.Text = $"{st.Nodes.Count} 主池 / {st.BackupCount} 备用";
+        CountBadge.Text = st.ServingBackup ? $"0 主池 / {st.BackupCount} 备用 · 当前使用备用线路" : $"{st.Nodes.Count} 主池 / {st.BackupCount} 备用";
         LastRefreshText.Text = st.LastRefresh.Length > 0 ? $"上次更新 {st.LastRefresh}" : "";
         var nodes = st.Nodes.Select(NodeRow).ToList();
         if (!nodes.SequenceEqual(_nodeCache))

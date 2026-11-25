@@ -199,7 +199,7 @@ public partial class KeeperHomeView
             : string.Empty;
         NodeSummary.Text = backup && pool.Count == 0 && _keeper.State.BackupCount > 0
             ? $"已有 {_keeper.State.BackupCount} 个备用节点，刷新后显示明细" + auditLine
-            : $"显示 {rows.Count} / {pool.Count} 个节点 · 延迟上限 {_keeper.State.MaxLatencyMs} ms" + auditLine;
+            : $"显示 {rows.Count} / {pool.Count} 个节点 · 延迟上限 {_keeper.State.MaxLatencyMs} ms" + (_keeper.State.ServingBackup ? " · 当前使用备用线路" : string.Empty) + auditLine;
     }
 
     private void UpdateStatus()
