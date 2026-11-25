@@ -197,7 +197,7 @@
                                 FontSize="11.5"
                                 Foreground="#A3A3A3"
                                 LineHeight="17"
-                                Text="重新抓取节点，实测达标才进主池"
+                                Text="重新抓取节点，实测达标才入池"
                                 TextWrapping="Wrap" />
                         </StackPanel>
                         <Button
@@ -318,7 +318,7 @@
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                            <TextBlock FontSize="14.5" FontWeight="SemiBold" Foreground="#E5E5E5" Text="主池线路" />
+                            <TextBlock FontSize="14.5" FontWeight="SemiBold" Foreground="#E5E5E5" Text="线路" />
                             <Border
                                 Margin="10,0,0,0"
                                 Padding="9,3"

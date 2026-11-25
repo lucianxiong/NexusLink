@@ -198,8 +198,8 @@ public partial class KeeperHomeView
             ? $" · 最近审查 {audit.At}：候选 {audit.Candidates}，拦截 {audit.Rejected} 个不安全节点" + (audit.Evicted > 0 ? $"，出池 {audit.Evicted} 个" : string.Empty)
             : string.Empty;
         NodeSummary.Text = backup && pool.Count == 0 && _keeper.State.BackupCount > 0
-            ? $"已有 {_keeper.State.BackupCount} 个备用节点，刷新后显示明细" + auditLine
-            : $"显示 {rows.Count} / {pool.Count} 个节点 · 延迟上限 {_keeper.State.MaxLatencyMs} ms" + (_keeper.State.ServingBackup ? " · 当前使用备用线路" : string.Empty) + auditLine;
+            ? $"{_keeper.State.BackupCount} 个安全节点实测延迟超过上限，未入池" + auditLine
+            : $"显示 {rows.Count} / {pool.Count} 个节点 · 延迟上限 {_keeper.State.MaxLatencyMs} ms" + auditLine;
     }
 
     private void UpdateStatus()

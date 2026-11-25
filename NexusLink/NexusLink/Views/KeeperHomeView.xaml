@@ -49,8 +49,8 @@
                     <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                     <ComboBox x:Name="PoolFilter" SelectedIndex="0" SelectionChanged="PoolChanged" Margin="0,0,16,0"
                               MinWidth="100" AutomationProperties.Name="节点池">
-                        <ComboBoxItem Content="主池"/>
-                        <ComboBoxItem Content="备用池"/>
+                        <ComboBoxItem Content="线路"/>
+                        <ComboBoxItem Content="未入池"/>
                     </ComboBox>
                     <TextBox x:Name="Search" Grid.Column="1" Foreground="#F1F1F1" CaretBrush="#F1F1F1" Margin="0,0,16,0"
                              AutomationProperties.Name="搜索节点" TextChanged="SearchChanged"/>
@@ -185,7 +185,7 @@
                                 <ComboBoxItem Content="800 毫秒"/>
                                 <ComboBoxItem Content="1200 毫秒"/>
                             </ComboBox>
-                            <TextBlock Text="主池只收实测出口在美国、日本、新加坡的节点，其余安全可用节点留作备用；主池为空时自动改用备用线路。延迟上限只影响自动选路的顺序：安全 &gt; 稳定 &gt; 带宽 &gt; 延迟，在用的节点只要没问题就不换" Style="{StaticResource Muted}" Margin="0,7,0,0"/>
+                            <TextBlock Text="安全且实测延迟低于上限的节点直接入池，延迟超标的不入池。选路顺序：安全 &gt; 稳定 &gt; 带宽 &gt; 延迟，在用的节点只要没问题就不换" Style="{StaticResource Muted}" Margin="0,7,0,0"/>
                         </StackPanel>
                     </Border>
                 </StackPanel>

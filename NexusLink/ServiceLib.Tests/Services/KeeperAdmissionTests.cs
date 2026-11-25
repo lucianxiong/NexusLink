@@ -45,32 +45,6 @@ public class KeeperAdmissionTests
         await ((string)method!.Invoke(null, ["https://example.com/list.txt"])!).Should().BeEqualTo("example.com");
     }
 
-    // ---- 主池闸：只看经节点实测到的出口是否在 美国 / 日本 / 新加坡 ----
-    [Test]
-    [Arguments("US", true)]
-    [Arguments("JP", true)]
-    [Arguments("SG", true)]
-    [Arguments("IT", false)] // 意大利出口：安全可用，但只能进备用池
-    [Arguments("DE", false)]
-    [Arguments("HK", false)] // 非海外出口
-    public async Task MainPoolGateAdmitsOnlyUsJpSgExit(string code, bool expected)
-    {
-        var exit = new KeeperExit { CountryCode = code, Country = code, Ip = "203.0.113.1" };
-        await MainPoolGate(exit).Should().BeEqualTo(expected);
-    }
-
-    [Test]
-    public async Task MainPoolGateRejectsUnprobedExit()
-    {
-        await MainPoolGate(null).Should().BeEqualTo(false);
-    }
-
-    private static bool MainPoolGate(KeeperExit? exit)
-    {
-        var method = typeof(KeeperService).GetMethod("EvaluateMainPool", BindingFlags.Static | BindingFlags.NonPublic);
-        return ((ValueTuple<bool, string>)method!.Invoke(null, [exit])!).Item1;
-    }
-
     // ---- 地区优先抓取：节点名标注 美 / 日 / 新 才优先实测；字母缩写带边界，RUS、AUS 不算 US ----
     [Test]
     [Arguments("🇺🇸 美国 洛杉矶 01", true)]
