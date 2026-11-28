@@ -27,6 +27,11 @@ public class Config
     public HysteriaItem HysteriaItem { get; set; }
     public ClashUIItem ClashUIItem { get; set; }
     public SystemProxyItem SystemProxyItem { get; set; }
+
+    // Agent 智能分流：本地代理 127.0.0.1:10808 常驻，系统代理保持关闭。
+    // 国内流量由 NO_PROXY / 分流规则直接出去，国外流量走 NexusLink 代理。
+    public bool LocalProxyAlwaysOn { get; set; }
+
     public WebDavItem WebDavItem { get; set; }
     public CheckUpdateItem CheckUpdateItem { get; set; }
     public Fragment4RayItem? Fragment4RayItem { get; set; }

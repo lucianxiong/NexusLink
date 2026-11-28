@@ -100,8 +100,9 @@ public partial class MainWindowViewModel : MyReactiveObject
 
             await Task.Run(async () =>
             {
-                // 未连接时不加载内核：启动、断开状态下改设置只更新配置，点「连接」时才真正拉起内核
-                if (ServiceLib.Services.KeeperService.CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+                // 未连接时不加载内核：启动、断开状态下改设置只更新配置，点「连接」时才真正拉起内核。
+                // 节点全死回退的挂起态下也不加载，避免重建 TUN 路由让整机再次断网。
+                if (ServiceLib.Services.KeeperService.CoreShouldRun(_config.SystemProxyItem.SysProxyType, _config.LocalProxyAlwaysOn, ServiceLib.Services.KeeperService.Instance.ProxySuspended))
                 {
                     await LoadCore(allResult.MainResult.Context, allResult.PreSocksResult?.Context);
                 }
@@ -110,7 +111,7 @@ public partial class MainWindowViewModel : MyReactiveObject
             });
             RxSchedulers.MainThreadScheduler.Schedule(async () =>
             {
-                if (!ServiceLib.Services.KeeperService.CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+                if (!ServiceLib.Services.KeeperService.CoreShouldRun(_config.SystemProxyItem.SysProxyType, _config.LocalProxyAlwaysOn, ServiceLib.Services.KeeperService.Instance.ProxySuspended))
                 {
                     return; // 内核没在运行，不做连通测试（否则每次启动都会提示一次失败）
                 }

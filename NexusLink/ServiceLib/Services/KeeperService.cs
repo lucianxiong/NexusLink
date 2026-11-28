@@ -43,6 +43,13 @@ public sealed class KeeperService
     private DateTime _startedAt = DateTime.MinValue;
     private int _running;                    // 1 = refresh in progress
     private string _lastSlot = string.Empty;
+    private int _refreshFailures;            // 连续刷新失败次数：失败后按 15min × 2^n 退避，不再每 5 分钟重试
+    private bool _refreshSucceeded;          // 本轮 RefreshAsync 是否成功（finally 里据此决定退避）
+    private int _allDeadRounds;              // 换血也救不回来的连续轮数：达到阈值回退直连
+    private volatile bool _shutDown;         // 退出中：不再重载内核、不再拉起任何东西
+    private volatile bool _proxySuspended;   // 节点全死已回退直连：暂停代理内核（TUN 随之撤销），常驻逻辑不得立刻拉起，避免整机断网
+    private CancellationTokenSource? _refreshCts; // 换血在途任务的取消源（退出时取消）
+    private readonly SemaphoreSlim _reloadLock = new(1, 1); // 内核重载串行化
 
     // ---- 守卫 v2 状态 ----
     private readonly Queue<(bool ok, int latency)> _probeWindow = new(); // 最近探测滑动窗口
@@ -59,8 +66,9 @@ public sealed class KeeperService
             var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
             try
             {
-                var addresses = await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, cancellationToken);
-                if (addresses.Length == 0 || addresses.Any(address => !IsPublicAddress(address)))
+                // 只连公网地址：DNS 同时返回公网和内网地址（双栈 / 污染）时过滤掉内网的，全部非公网才拒绝
+                var addresses = OnlyPublicAddresses(await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, cancellationToken));
+                if (addresses.Length == 0)
                 {
                     throw new HttpRequestException("Subscription source resolved to a restricted address.");
                 }
@@ -117,6 +125,9 @@ public sealed class KeeperService
         _config = config;
         _reloadFunc = reloadFunc;
         LoadState();
+        // 上次因节点全死回退并挂起了内核：重启后继续保持挂起，绝不自动拉起带 TUN 的内核导致整机断网；
+        // 等换血确认有达标节点后由 ResumeProxyIfSuspendedAsync 恢复。
+        _proxySuspended = State.ProxySuspended;
         await EnsureGroupAsync();
         await ReconcileNodesFromDbAsync();
         _timer = new Timer(async _ => await TimerTickAsync(), null, TimeSpan.FromSeconds(20), TimeSpan.FromMinutes(5));
@@ -126,16 +137,34 @@ public sealed class KeeperService
         _probeWindow.Clear();
 
         _coreApiOk = false;
+        _wsCts?.Cancel();
+        _wsCts?.Dispose();
         _wsCts = new CancellationTokenSource();
+        _refreshCts?.Cancel();
+        _refreshCts?.Dispose();
+        _refreshCts = new CancellationTokenSource();
+        _shutDown = false;
         _ = Task.Run(() => SpeedLoopAsync());
+
+        // Agent 智能分流：系统代理保持关闭，但本地代理必须常驻可用。
+        // 挂起态（上次节点全死回退）下不拉内核，TUN 不会重建，整机保持直连。
+        if (_config.LocalProxyAlwaysOn && !CoreManager.Instance.IsRunning && !_proxySuspended)
+        {
+            await EnsureCoreRunningAsync();
+        }
         if (State.Enabled)
         {
-            var items = await AppManager.Instance.ProfileItems(SubId);
-            if (items == null || items.Count < 3 || State.PolicyVersion < CurrentPolicyVersion)
+            var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
+            if (items.Count < 3 || State.PolicyVersion < CurrentPolicyVersion)
             {
                 State.PolicyVersion = CurrentPolicyVersion;
                 SaveState();
                 _ = RefreshAsync();
+            }
+            else if (items.Count < Math.Max(1, State.MinAlive) && (State.QualityLinks.Count > 0 || State.LastGoodLinks.Count > 0))
+            {
+                // 池子被剔到不足下限：先用最近一次确认可用的节点库补位（last-known-good 回滚），不必等整轮换血
+                _lastTopupAt = DateTime.MinValue;
             }
         }
         Logging.SaveLog($"KeeperService started (grace={State.StartupGraceSec}s guardN={State.GuardConsecutive} guardLat={State.GuardLatencyMs}ms)");
@@ -203,8 +232,17 @@ public sealed class KeeperService
     private async Task<int> AuditExistingPoolAsync()
     {
         var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
-        var bad = items.Where(t => !t.IsValid() || t.GetAllowInsecure() || !SecurityAllows(t) || IsNonOverseasExit(t)
-                || NameRejection(t.Remarks) != null).ToList();
+        // 硬性问题（链接失效 / 允许不安全加密）一律出池；软性问题（等级不够、出口在大陆港澳台、名称不合规）
+        // 受 MinAlive 下限约束：全剔光会让内核空池，代理开着却无节点可用
+        var hard = items.Where(t => !t.IsValid() || t.GetAllowInsecure()).ToList();
+        var soft = items.Where(t => !hard.Contains(t) && (!SecurityAllows(t) || IsNonOverseasExit(t)
+                || NameRejection(t.Remarks) != null)).ToList();
+        var budget = EvictionBudget(items.Count - hard.Count, State.MinAlive);
+        if (budget < soft.Count)
+        {
+            Logging.SaveLog($"KeeperService security audit: {soft.Count - budget} non-compliant nodes kept to stay above MinAlive={State.MinAlive} (pool would be empty otherwise)");
+        }
+        var bad = hard.Concat(soft.Take(budget)).ToList();
         if (bad.Count == 0)
         {
             return 0;
@@ -226,11 +264,12 @@ public sealed class KeeperService
             {
                 return;
             }
-            // 池健康盘点：每 TopupIntervalHours（降级检查+缺员补位，不动好节点）
-            if ((DateTime.Now - _lastTopupAt).TotalHours >= State.TopupIntervalHours)
+            // 池健康盘点：每 TopupIntervalHours（降级检查+缺员补位，不动好节点）；池子低于下限时也立即盘点
+            var shortPool = (await AppManager.Instance.ProfileItems(SubId) ?? []).Count < Math.Max(1, State.MinAlive);
+            if ((DateTime.Now - _lastTopupAt).TotalHours >= State.TopupIntervalHours || shortPool)
             {
                 _lastTopupAt = DateTime.Now;
-                if (!State.Online && !IsRunning)
+                if ((!State.Online && !IsRunning) || shortPool)
                 {
                     await HealthSweepAsync();
                 }
@@ -286,11 +325,30 @@ public sealed class KeeperService
             NoticeManager.Instance.SendMessage("畅连已让出系统代理");
             return;
         }
+        // 内核在连接状态下意外退出：必须立刻让出系统代理，否则 TUN / 全局模式下整机会断网
+        if (ShouldFallbackToDirect(_config?.SystemProxyItem.SysProxyType ?? ESysProxyType.ForcedClear,
+                CoreManager.Instance.IsRunning,
+                (DateTime.Now - _startedAt).TotalSeconds, State.StartupGraceSec))
+        {
+            await FallbackToDirectAsync("内核已意外停止");
+            return;
+        }
+
+        // 常驻模式下内核意外退出：自动拉起，保证 Agent 的本地代理地址一直可用。
+        // 但节点全死回退后处于挂起态，绝不能拉起（否则 TUN 重建、整机再次断网）。
+        if (_config?.LocalProxyAlwaysOn == true && !CoreManager.Instance.IsRunning
+            && !_proxySuspended
+            && (DateTime.Now - _startedAt).TotalSeconds >= State.StartupGraceSec)
+        {
+            Logging.SaveLog("KeeperService: local proxy core missing, restarting in always-on mode");
+            await EnsureCoreRunningAsync();
+            return;
+        }
         try
         {
             // 兜底：不在连接状态时内核不留在后台（启动时未连接、系统代理被其他应用接管等情况）
             if (_config != null && CoreManager.Instance.IsRunning
-                && !CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+                && !CoreShouldRun(_config.SystemProxyItem.SysProxyType, _config.LocalProxyAlwaysOn))
             {
                 await SyncCoreWithConnectionAsync(false);
                 return;
@@ -336,6 +394,10 @@ public sealed class KeeperService
         }
 
         State.Online = await VerifyProxyAsync();
+        if (State.Online)
+        {
+            _allDeadRounds = 0;
+        }
         if (!_adoptionDone)
         {
             _adoptionDone = true;
@@ -430,8 +492,15 @@ public sealed class KeeperService
             var ok = await RefreshAsync();
             if (!ok)
             {
+                _allDeadRounds++;
                 NoticeManager.Instance.SendMessage("畅连管家：⚠️ 线路劣化且本轮没有新节点达标，已保留当前连接");
                 Logging.SaveLog("KeeperService guard: ALL POOLS BAD — keep current connection (ALARM)");
+                // 确实断流（探测全部失败）且连续两轮换血都救不回来：继续占着系统代理只会让整机断网，回退直连
+                if (ShouldFallbackAllDead(window.Any(p => p.ok), _allDeadRounds))
+                {
+                    await FallbackToDirectAsync("所有节点均不可用");
+                    _allDeadRounds = 0;
+                }
             }
         }
         catch { }
@@ -501,8 +570,8 @@ public sealed class KeeperService
     private const int SpeedProbeSeconds = 5;         // 单个节点带宽实测的最长时间
     private const string SpeedProbeUrl = "https://speed.cloudflare.com/__down?bytes=50000000";
 
-    // 入池延迟上限：不高于隔离门槛，也不高于用户设置的 MaxLatencyMs
-    private int MainLatencyLimit => Math.Min(State.QuarantineMaxLatencyMs, Math.Clamp(State.MaxLatencyMs, 200, 3000));
+    // 入池延迟上限：只看用户设置的 MaxLatencyMs（不再被一个界面上看不到的隔离门槛二次截断）
+    private int MainLatencyLimit => Math.Clamp(State.MaxLatencyMs, 200, 3000);
 
     // 非海外出口 = 中国大陆及港澳台（规则：节点只能是海外安全节点）
     private static readonly HashSet<string> NonOverseasCodes = new(StringComparer.OrdinalIgnoreCase) { "CN", "HK", "MO", "TW" };
@@ -674,7 +743,14 @@ public sealed class KeeperService
         }
         catch (Exception ex)
         {
-            Logging.SaveLog("KeeperService select", ex);
+            if (IsTransientConnectError(ex))
+            {
+                Logging.SaveLog("KeeperService select: core API not reachable (transient), will retry on next poll");
+            }
+            else
+            {
+                Logging.SaveLog("KeeperService select", ex);
+            }
             return false;
         }
     }
@@ -894,52 +970,69 @@ public sealed class KeeperService
                 return;
             }
             var items = await AppManager.Instance.ProfileItems(SubId) ?? [];
-            // 降级：连续 DegradeRounds 轮真测速 > DegradeLatencyMs → 出池
-            var toRemove = new List<ProfileItem>();
+            var poolKeys = items.Select(GetQualityKey).ToHashSet();
+            // 降级计数按节点身份（QualityKey）记：同名节点互不污染；离池节点的旧条目顺手清掉
+            foreach (var orphan in State.DegradeMap.Keys.Where(k => !poolKeys.Contains(k)).ToList())
+            {
+                State.DegradeMap.Remove(orphan);
+            }
+            // 降级：连续 DegradeRounds 轮真测速 > DegradeLatencyMs → 出池（受 MinAlive 下限约束）
+            var degraded = new List<ProfileItem>();
             foreach (var it in items)
             {
                 var d = delays.Where(kv => kv.Key == it.Remarks || kv.Key.EndsWith(it.Remarks, StringComparison.Ordinal)).Select(kv => (int?)kv.Value).FirstOrDefault();
+                var key = GetQualityKey(it);
+                if (key.IsNullOrEmpty())
+                {
+                    continue;
+                }
                 if (d == null)
                 {
                     continue; // 本轮组测速未覆盖
                 }
                 if (d > State.DegradeLatencyMs)
                 {
-                    State.DegradeMap[it.Remarks] = State.DegradeMap.GetValueOrDefault(it.Remarks) + 1;
-                    if (State.DegradeMap[it.Remarks] >= State.DegradeRounds)
+                    State.DegradeMap[key] = State.DegradeMap.GetValueOrDefault(key) + 1;
+                    if (State.DegradeMap[key] >= State.DegradeRounds)
                     {
-                        toRemove.Add(it);
+                        degraded.Add(it);
                     }
                 }
                 else
                 {
-                    State.DegradeMap.Remove(it.Remarks);
+                    State.DegradeMap.Remove(key);
                 }
+            }
+            var toRemove = degraded.Take(EvictionBudget(items.Count, State.MinAlive)).ToList();
+            if (degraded.Count > toRemove.Count)
+            {
+                Logging.SaveLog($"KeeperService sweep: {degraded.Count - toRemove.Count} degraded nodes kept to stay above MinAlive={State.MinAlive}");
             }
             if (toRemove.Count > 0)
             {
                 await ConfigHandler.RemoveServers(_config, toRemove);
                 foreach (var it in toRemove)
                 {
-                    State.DegradeMap.Remove(it.Remarks);
+                    State.DegradeMap.Remove(GetQualityKey(it));
                     Logging.SaveLog($"KeeperService sweep: degraded out '{it.Remarks}' (>{State.DegradeLatencyMs}ms x{State.DegradeRounds})");
                 }
                 items = items.Where(t => !toRemove.Contains(t)).ToList();
-                _ = _reloadFunc?.Invoke();
             }
-            // 补位：池内不足 PoolMinMain → 从 QualityLinks，本轮达标链接库，挑未入池的补齐
-            if (items.Count < State.PoolMinMain && State.QualityLinks.Count > 0)
+            // 补位：池内不足 PoolMinMain → 从本轮达标库 + 最近一次确认可用的节点库（last-known-good），挑未入池的补齐
+            if (items.Count < State.PoolMinMain)
             {
                 var inPool = items.Select(t => $"{t.Address.ToLowerInvariant()}:{t.Port}").ToHashSet();
                 var candidates = new List<string>();
-                foreach (var link in State.QualityLinks)
+                foreach (var link in State.QualityLinks.Concat(State.LastGoodLinks).Distinct())
                 {
                     if (candidates.Count >= State.PoolMinMain - items.Count)
                     {
                         break;
                     }
                     var hp = ParseHostPort(link);
-                    if (ParsePoolCandidate(link) == null || hp == null || inPool.Contains($"{hp.Value.host.ToLowerInvariant()}:{hp.Value.port}"))
+                    // 与换血同一道出口闸：实测出口在大陆 / 港澳台的节点不得经补位回到池里
+                    if (ParsePoolCandidate(link) == null || hp == null || inPool.Contains($"{hp.Value.host.ToLowerInvariant()}:{hp.Value.port}")
+                        || FmtHandler.ResolveConfig(link, out _) is not { } candidate || IsNonOverseasExit(candidate))
                     {
                         continue;
                     }
@@ -953,13 +1046,17 @@ public sealed class KeeperService
                     {
                         items = await AppManager.Instance.ProfileItems(SubId) ?? items;
                         Logging.SaveLog($"KeeperService sweep: topped up {cnt} nodes (pool now {items.Count})");
-                        _ = _reloadFunc?.Invoke();
                     }
                 }
             }
             State.Nodes = BuildNodes(items);
             State.LastAlive = items.Count;
             SaveState();
+            // 降级 / 补位最多触发一次内核重载：在用节点还在就不重载，新成员留到内核下次自然重启再纳入
+            if (toRemove.Count > 0 && ShouldReloadCoreForPoolChange(State.ActiveIndexId, items))
+            {
+                await ReloadCoreAsync("active node degraded out");
+            }
             NoticeManager.Instance.SendMessage($"畅连管家：池子体检完成——{items.Count} 条在池，本轮降级 {toRemove.Count} 条");
         }
         catch (Exception ex)
@@ -1079,13 +1176,20 @@ public sealed class KeeperService
         }
         try
         {
+            _refreshSucceeded = false;
+            var token = _refreshCts?.Token ?? new CancellationToken(true);
             NoticeManager.Instance.SendMessage("畅连管家：开始抓取全球免费节点池…");
             // 1. fetch pools
             var links = new List<string>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
             var sourceByHostPort = new Dictionary<string, string>(StringComparer.Ordinal); // 节点 host:port → 来源池短名
             var rejectedReasons = new Dictionary<string, int>(); // 被安全闸拦下的节点按原因计数
-            var poolUrls = State.Pools.Distinct().Take(20).ToList();
+            var poolUrls = State.Pools.Distinct().ToList();
+            if (poolUrls.Count > 20)
+            {
+                Logging.SaveLog($"KeeperService: {poolUrls.Count - 20} pool sources beyond the limit of 20 are ignored");
+                poolUrls = poolUrls.Take(20).ToList();
+            }
             RefreshStatus = "正在更新节点来源";
             var catalogs = await Task.WhenAll(poolUrls.Select(async url =>
             {
@@ -1268,14 +1372,14 @@ public sealed class KeeperService
                 var ready = false;
                 for (var i = 0; i < 20; i++)
                 {
-                    await Task.Delay(1000);
+                    await Task.Delay(1000, token);
                     try
                     {
-                        _ = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{TestApiPort}/proxies");
+                        _ = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{TestApiPort}/proxies", token);
                         ready = true;
                         break;
                     }
-                    catch { }
+                    catch (Exception ex) when (ex is not OperationCanceledException) { }
                 }
                 if (!ready)
                 {
@@ -1283,23 +1387,33 @@ public sealed class KeeperService
                     return false;
                 }
                 // 等首轮 health-check 出结果，再触发组级真测速（对 Google）
-                await Task.Delay(5000);
+                await Task.Delay(5000, token);
                 var delayJson = string.Empty;
                 for (var i = 0; i < 3; i++)
                 {
                     try
                     {
-                        delayJson = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{TestApiPort}/group/TEST/delay?url={Uri.EscapeDataString(TestUrl)}&timeout=5000");
+                        delayJson = await _httpDirect.GetStringAsync($"http://{Global.Loopback}:{TestApiPort}/group/TEST/delay?url={Uri.EscapeDataString(TestUrl)}&timeout=5000", token);
                         break;
                     }
+                    catch (OperationCanceledException) { throw; }
                     catch
                     {
-                        await Task.Delay(2000);
+                        await Task.Delay(2000, token);
                     }
                 }
                 RefreshStatus = $"正在验证 {parsed.Count} 个节点的第二个测速目标";
-                var secondary = ParseDelayMap(await _httpDirect.GetStringAsync(
-                    $"http://{Global.Loopback}:{TestApiPort}/group/TEST/delay?url={Uri.EscapeDataString(SecondaryTestUrl)}&timeout=5000"));
+                var secondary = new Dictionary<string, int>();
+                try
+                {
+                    // 第二测速目标失败只意味着少一道交叉验证，不该让整轮换血作废
+                    secondary = ParseDelayMap(await _httpDirect.GetStringAsync(
+                        $"http://{Global.Loopback}:{TestApiPort}/group/TEST/delay?url={Uri.EscapeDataString(SecondaryTestUrl)}&timeout=5000", token));
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Logging.SaveLog("KeeperService refresh: secondary test target unavailable, using primary results only");
+                }
                 testMap = ParseDelayMap(delayJson)
                     .Where(pair => pair.Value > 0 && secondary.GetValueOrDefault(pair.Key) > 0)
                     .ToDictionary(pair => pair.Key, pair => pair.Value);
@@ -1407,15 +1521,17 @@ public sealed class KeeperService
                 })
                 .ToList();
             Logging.SaveLog($"KeeperService refresh: pools written quality={qualityProxies.Count} overCap={backupProxies.Count}");
-            State.QualityLinks = qualityLinks;
+            // 补位库在 serveSet 算出后赋值（见下）：只收通过出口闸的节点
             State.BackupCount = backupProxies.Count;
             State.BackupNodes = backupNodes;
             State.Tested = parsed.Count;
+            // 换血前记录当前在用节点：只要它还在池里，就不应该为了成员增删重启内核打断长连接
+            var activeBefore = State.ActiveIndexId;
             if (qualityProxies.Count > 0)
             {
-                await File.WriteAllTextAsync(Path.Combine(WorkDir, "quality.yaml"), BuildClashYaml(qualityProxies));
+                await File.WriteAllTextAsync(Path.Combine(WorkDir, "quality.yaml"), BuildClashYaml(qualityProxies), token);
             }
-            await File.WriteAllTextAsync(Path.Combine(WorkDir, "backup.yaml"), BuildClashYaml(backupProxies));
+            await File.WriteAllTextAsync(Path.Combine(WorkDir, "backup.yaml"), BuildClashYaml(backupProxies), token);
             // 实测出口在中国大陆或港澳台的节点不进池，名称闸漏网的按出口归属把关
             string? HpKeyOf(string link)
             {
@@ -1438,21 +1554,31 @@ public sealed class KeeperService
                 serveSet.Add(link);
                 serveHp.Add(key);
             }
+            // 补位库只收通过出口闸的节点，否则补位会绕过出口审查把大陆 / 港澳台节点放回池里
+            State.QualityLinks = serveSet;
             if (serveSet.Count == 0)
             {
                 // 本轮没有速度达标的节点：池子原样保留，只做安全复审，不安全的旧节点照样清掉
                 var evictedWhileRetained = await AuditExistingPoolAsync();
                 if (evictedWhileRetained > 0)
                 {
-                    State.Nodes = BuildNodes(await AppManager.Instance.ProfileItems(SubId) ?? []);
+                    var retained = await AppManager.Instance.ProfileItems(SubId) ?? [];
+                    State.Nodes = BuildNodes(retained);
                     if (_config.IndexId == GroupIndexId && _reloadFunc != null)
                     {
-                        Logging.SaveLog($"KeeperService: pool membership changed (-{evictedWhileRetained}), reloading core");
-                        await _reloadFunc();
+                        if (ShouldReloadCoreForPoolChange(activeBefore, retained))
+                        {
+                            await ReloadCoreAsync($"pool membership changed (-{evictedWhileRetained}), active node gone");
+                        }
+                        else
+                        {
+                            Logging.SaveLog($"KeeperService: pool membership changed (-{evictedWhileRetained}), active node '{activeBefore}' still present; defer core reload");
+                        }
                     }
                 }
                 State.LastRefresh = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                 _lastRefreshAt = DateTime.Now;
+                _refreshSucceeded = true;
                 SaveState();
                 RefreshStatus = $"刷新完成 · 本轮 {parsed.Count} 个节点无一速度达标，保留现有 {State.Nodes.Count} 条线路";
                 Logging.SaveLog($"KeeperService refresh: no node under latency cap {MainLatencyLimit}ms; retained pool");
@@ -1464,7 +1590,13 @@ public sealed class KeeperService
             var existing = await AppManager.Instance.ProfileItems(SubId) ?? [];
             var inPool = existing.Select(t => $"{t.Address.ToLowerInvariant()}:{t.Port}").ToHashSet();
             var importLinks = serveSet.Where(link => !inPool.Contains(HpKeyOf(link)!)).ToList();
-            var stale = existing.Where(t => !serveHp.Contains($"{t.Address.ToLowerInvariant()}:{t.Port}")).ToList();
+            var staleAll = existing.Where(t => !serveHp.Contains($"{t.Address.ToLowerInvariant()}:{t.Port}")).ToList();
+            // 剔旧节点同样受 MinAlive 下限约束：新导入不足时不能把池子清空
+            var stale = staleAll.Take(EvictionBudget(existing.Count + importLinks.Count, State.MinAlive)).ToList();
+            if (staleAll.Count > stale.Count)
+            {
+                Logging.SaveLog($"KeeperService: {staleAll.Count - stale.Count} stale nodes kept to stay above MinAlive={State.MinAlive}");
+            }
             if (importLinks.Count > 0)
             {
                 var count = await ConfigHandler.AddBatchServers(_config, string.Join(Environment.NewLine, importLinks), SubId, false);
@@ -1489,20 +1621,24 @@ public sealed class KeeperService
             if (_config.IndexId.IsNullOrEmpty() && items.Count > 0)
             {
                 await ApplyActiveAsync(items);
-                if (_reloadFunc != null)
+                await ReloadCoreAsync("first pool ready");
+            }
+            else if (_config.IndexId == GroupIndexId && membershipChanged)
+            {
+                // 成员增删不应该无条件重载：重载会断开所有 TCP 连接（含正在跑的 agent 长连接）。
+                // 在用节点仍在池里时只更新选择器，新成员等下次内核自然重启再纳入。
+                if (ShouldReloadCoreForPoolChange(activeBefore, items))
                 {
-                    await _reloadFunc();
+                    await ReloadCoreAsync($"pool membership changed (+{importLinks.Count} / -{stale.Count + evictedCount}), active node gone");
+                }
+                else
+                {
+                    Logging.SaveLog($"KeeperService: pool membership changed (+{importLinks.Count} / -{stale.Count + evictedCount}), active node '{activeBefore}' still present; defer core reload");
                 }
             }
-            else if (_config.IndexId == GroupIndexId && membershipChanged && _reloadFunc != null)
-            {
-                // 策略组按订阅筛选条件动态取成员：新节点入池、或不达标 / 不安全节点被剔除后，
-                // 必须重载内核，运行中的配置才会跟着变，否则要等下次切线或重启才生效。
-                Logging.SaveLog($"KeeperService: pool membership changed (+{importLinks.Count} / -{stale.Count + evictedCount}), reloading core");
-                await _reloadFunc();
-            }
-            // 7b. 选路：内核重载后选择器会复位，重新按策略应用，手动指定 > 自动优选
-            if (_coreApiOk)
+            // 7b. 选路：内核重载后选择器会复位，重新按策略应用，手动指定 > 自动优选。
+            //     先等 clash API 真正就绪，避免对着还没监听的端口连打 4 次堆栈
+            if (_coreApiOk && await WaitForCoreApiAsync())
             {
                 for (var attempt = 0; attempt < 4 && !await ApplySelectionAsync(); attempt++)
                 {
@@ -1512,6 +1648,8 @@ public sealed class KeeperService
             // 8. state
             State.LastRefresh = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             _lastRefreshAt = DateTime.Now;
+            State.LastGoodLinks = [.. serveSet]; // last-known-good：下次池子被剔空 / 补位时用它回滚
+            _refreshSucceeded = true;
             State.LastAlive = items.Count;
             State.Nodes = BuildNodes(items, sourceByHostPort);
             SaveState();
@@ -1519,7 +1657,17 @@ public sealed class KeeperService
             RefreshStatus = $"刷新完成 · 已测速 {parsed.Count} 个节点 · {items.Count} 条线路安全且速度达标入池" + rejectedLine;
             NoticeManager.Instance.SendMessage($"畅连管家：换血完成——实测 {parsed.Count} 个节点，{qualityProxies.Count} 条安全且速度达标入池，{backupProxies.Count} 条延迟超标未入池{rejectedLine}");
             Logging.SaveLog($"KeeperService refreshed: tested={parsed.Count} pool={items.Count} quality={qualityProxies.Count} overCap={backupProxies.Count} rejected={State.SecurityAudit.Rejected}");
+            // 若此前因节点全死回退并挂起了内核，现在换血拿到了达标节点，自动解除挂起、重建内核（TUN 随之恢复）
+            if (items.Count >= Math.Max(1, State.MinAlive))
+            {
+                await ResumeProxyIfSuspendedAsync("换血拿到达标节点");
+            }
             return true;
+        }
+        catch (OperationCanceledException)
+        {
+            Logging.SaveLog("KeeperService refresh cancelled (shutting down)");
+            return false;
         }
         catch (Exception ex)
         {
@@ -1529,6 +1677,18 @@ public sealed class KeeperService
         }
         finally
         {
+            // 失败也计入刷新周期并指数退避：否则每 5 分钟的定时器会立刻再触发一轮全量抓取 + 测速
+            if (!_refreshSucceeded)
+            {
+                _refreshFailures++;
+                var wait = _shutDown ? TimeSpan.Zero : RefreshRetryDelay(_refreshFailures, TimeSpan.FromHours(Math.Max(1, State.RefreshIntervalHours)));
+                _lastRefreshAt = DateTime.Now - TimeSpan.FromHours(Math.Max(1, State.RefreshIntervalHours)) + wait;
+                Logging.SaveLog($"KeeperService refresh failed ({_refreshFailures} in a row), next attempt in {Math.Round(wait.TotalMinutes)} min");
+            }
+            else
+            {
+                _refreshFailures = 0;
+            }
             if (!RefreshStatus.StartsWith("刷新完成", StringComparison.Ordinal))
             {
                 RefreshStatus = "刷新未完成 · 查看运行日志";
@@ -1752,6 +1912,127 @@ public sealed class KeeperService
         }
     }
 
+    // 连接状态下内核是否意外退出（启动宽限期内不算，避免刚点连接就被轮询误判）
+    public static bool ShouldFallbackToDirect(ESysProxyType sysProxyType, bool coreRunning,
+        double secondsSinceStart, double startupGraceSec)
+        => sysProxyType == ESysProxyType.ForcedChange && !coreRunning && secondsSinceStart >= startupGraceSec;
+
+    // 内核意外退出后的自愈：清系统代理 + 落盘未连接状态 + 通知用户，确保整机恢复直连
+    // 节点全死判定：本轮探测无一成功，且连续 deadRounds 轮换血都失败，才回退直连（短暂抖动不断开用户的连接）
+    public static bool ShouldFallbackAllDead(bool anyProbeOk, int deadRounds, int threshold = 2)
+        => !anyProbeOk && deadRounds >= threshold;
+
+    // 软性驱逐预算：剔完之后池子里至少还要留 minAlive 条；池子本来就不足时一条都不剔
+    public static int EvictionBudget(int remaining, int minAlive)
+        => Math.Max(0, remaining - Math.Max(0, minAlive));
+
+    // 刷新失败后的下次重试间隔：15 分钟起指数退避，封顶为正常换血周期（不超过 24h）
+    public static TimeSpan RefreshRetryDelay(int failures, TimeSpan interval)
+    {
+        var floor = TimeSpan.FromMinutes(15);
+        var ceiling = interval > floor ? interval : floor;
+        if (ceiling > TimeSpan.FromHours(24))
+        {
+            ceiling = TimeSpan.FromHours(24);
+        }
+        var minutes = 15.0 * Math.Pow(2, Math.Clamp(failures - 1, 0, 8));
+        return minutes >= ceiling.TotalMinutes ? ceiling : TimeSpan.FromMinutes(minutes);
+    }
+
+    // DNS 结果只保留公网地址；一个都没有返回空数组（调用方按受限地址处理）
+    public static IPAddress[] OnlyPublicAddresses(IPAddress[] addresses)
+        => addresses.Where(IsPublicAddress).ToArray();
+
+    private async Task FallbackToDirectAsync(string reason)
+    {
+        if (_config == null)
+        {
+            return;
+        }
+        // 常驻模式（SysProxyType=ForcedClear）下节点全死同样要回退：原条件只认 ForcedChange，
+        // 导致智能分流/未连接状态下内核带着 TUN 继续跑，节点全死时整机断网。
+        _proxySuspended = true;
+        State.ProxySuspended = true;
+        _config.SystemProxyItem.SysProxyType = ESysProxyType.ForcedClear;
+        State.Online = false;
+        State.LatencyMs = -1;
+        State.ExitNode = State.ExitIp = State.ExitCountry = State.ExitCity = State.ExitIsp = State.ExitCode = string.Empty;
+        lock (_probeWindow)
+        {
+            _probeWindow.Clear();
+        }
+        _allDeadRounds = 0;
+        await ConfigHandler.SaveConfig(_config);
+        try
+        {
+            await SysProxyHandler.UpdateSysProxy(_config, false);
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService fallback sysproxy", ex);
+        }
+        // 关键：停掉内核。TUN 的虚拟网卡与路由随内核进程退出而撤销，整机立刻恢复直连；
+        // 不清这一层的话，系统代理虽清了，TUN 仍接管全部流量且没有可用节点，整机会断网。
+        try
+        {
+            if (CoreManager.Instance.IsRunning)
+            {
+                await CoreManager.Instance.CoreStop();
+                Logging.SaveLog("KeeperService fallback: core stopped, TUN route released");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService fallback core stop", ex);
+        }
+        _startedAt = DateTime.Now;
+        SaveState();
+        Logging.SaveLog($"KeeperService: fallback to direct - {reason}");
+        NoticeManager.Instance.SendMessage($"畅连：{reason}，已自动恢复直连（内核已暂停，待节点恢复后自动重启）");
+    }
+
+    // 换血拿到可用节点后，解除节点全死的挂起并重新拉起内核（TUN 随即重建）。
+    // 仅在确实有达标节点时调用，避免刚恢复又被判定全死、反复重启内核。
+    private async Task ResumeProxyIfSuspendedAsync(string reason)
+    {
+        if (!_proxySuspended || _config == null || _shutDown || _reloadFunc == null)
+        {
+            return;
+        }
+        _proxySuspended = false;
+        State.ProxySuspended = false;
+        SaveState();
+        _startedAt = DateTime.Now;
+        lock (_probeWindow)
+        {
+            _probeWindow.Clear();
+        }
+        try
+        {
+            var started = await EnsureCoreRunningAsync();
+            if (started)
+            {
+                await SysProxyHandler.UpdateSysProxy(_config, false);
+                Logging.SaveLog($"KeeperService: proxy resumed - {reason}");
+                NoticeManager.Instance.SendMessage("畅连：已找到可用节点，代理自动恢复");
+            }
+            else
+            {
+                Logging.SaveLog($"KeeperService: proxy resume failed to start core - {reason}");
+                _proxySuspended = true;
+                State.ProxySuspended = true;
+                SaveState();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService proxy resume", ex);
+            _proxySuspended = true;
+            State.ProxySuspended = true;
+            SaveState();
+        }
+    }
+
     // 连接/断开：切系统代理（ForcedChange=走畅连 / ForcedClear=全部直连）。
     // 内核只在连接期间运行：断开就结束内核进程；重新连接时内核没在跑，就先把它拉起来再开系统代理。
     public async Task SetConnectedAsync(bool on)
@@ -1759,6 +2040,18 @@ public sealed class KeeperService
     if (_config == null)
     {
     return;
+    }
+    // 用户主动点「连接」= 强制解除节点全死的挂起态，重新尝试拉内核（TUN 随内核重建）
+    if (on && _proxySuspended)
+    {
+    _proxySuspended = false;
+    State.ProxySuspended = false;
+    SaveState();
+    _startedAt = DateTime.Now;
+    lock (_probeWindow)
+    {
+    _probeWindow.Clear();
+    }
     }
     var target = on ? ESysProxyType.ForcedChange : ESysProxyType.ForcedClear;
     if (_config.SystemProxyItem.SysProxyType != target)
@@ -1790,21 +2083,91 @@ public sealed class KeeperService
     NoticeManager.Instance.SendMessage(on ? "畅连：已连接，浏览器走畅连线路" : "畅连：已断开，浏览器恢复直连，内核进程已退出");
     }
 
-    // 内核是否应该在后台运行：只在连接状态；TUN 模式开启时也一样（未连接就不留内核，TUN 随内核一起停）
+    // 内核是否应该在后台运行：连接状态，或 Agent 智能分流的本地代理常驻模式
     public static bool CoreShouldRun(ESysProxyType sysProxyType)
-        => sysProxyType == ESysProxyType.ForcedChange;
+        => CoreShouldRun(sysProxyType, false);
+
+    public static bool CoreShouldRun(ESysProxyType sysProxyType, bool localProxyAlwaysOn)
+        => CoreShouldRun(sysProxyType, localProxyAlwaysOn, false);
+
+    // proxySuspended=节点全死已回退直连：此时一律不拉内核。TUN 模式下内核一旦被拉起会重建虚拟网卡并接管整机路由，
+    // 没有可用节点就会让整机断网；必须等换血拿到可用节点、显式解除挂起后才恢复。
+    public static bool CoreShouldRun(ESysProxyType sysProxyType, bool localProxyAlwaysOn, bool proxySuspended)
+        => !proxySuspended && (sysProxyType == ESysProxyType.ForcedChange || localProxyAlwaysOn);
+
+    // 节点全死回退期间是否允许常驻逻辑拉起内核（供状态轮询调用）
+    public bool ProxySuspended => _proxySuspended;
+
+    // 只有当前在用节点确实离开池子时才需要重载内核。
+    // 识别不到当前节点时保守重载，避免配置与池子长期不一致。
+    public static bool ShouldReloadCoreForPoolChange(string activeIndexId, IEnumerable<ProfileItem> items)
+        => activeIndexId.IsNullOrEmpty() || !items.Any(t => t.IndexId == activeIndexId);
+
+    // 统一的重载入口：串行化（同一轮里降级 + 补位不会并发重载）、退出中不再重载、异常有日志不变成未观测任务
+    private async Task ReloadCoreAsync(string reason)
+    {
+        if (_shutDown || _reloadFunc == null)
+        {
+            return;
+        }
+        await _reloadLock.WaitAsync();
+        try
+        {
+            if (_shutDown)
+            {
+                return;
+            }
+            Logging.SaveLog($"KeeperService: reloading core ({reason})");
+            await _reloadFunc();
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService reload core", ex);
+        }
+        finally
+        {
+            _reloadLock.Release();
+        }
+    }
+
+    // 内核刚重载时 clash API 端口还没监听：最多等 5 秒，通了才去下发选路
+    private async Task<bool> WaitForCoreApiAsync(int attempts = 10)
+    {
+        var api = $"http://{Global.Loopback}:{AppManager.Instance.StatePort2}";
+        for (var i = 0; i < attempts; i++)
+        {
+            try
+            {
+                _ = await _httpDirect.GetStringAsync($"{api}/proxies");
+                return true;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                await Task.Delay(500);
+            }
+        }
+        return false;
+    }
+
+    // 选路失败的日志分级：内核刚重载 / 端口未监听导致的连接被拒属瞬态，不打整段堆栈淹没真实错误
+    public static bool IsTransientConnectError(Exception ex)
+        => ex is HttpRequestException hre && hre.InnerException is System.Net.Sockets.SocketException se
+            && se.SocketErrorCode is System.Net.Sockets.SocketError.ConnectionRefused
+               or System.Net.Sockets.SocketError.TimedOut;
 
     // 拉起内核；已经在运行则直接返回 true，起不来返回 false
     private async Task<bool> EnsureCoreRunningAsync()
     {
-    if (CoreManager.Instance.IsRunning)
-    {
-    return true;
-    }
-    if (_reloadFunc == null)
-    {
-    return false;
-    }
+        if (CoreManager.Instance.IsRunning)
+        {
+            return true;
+        }
+        if (_reloadFunc == null || _shutDown)
+        {
+            return false;
+        }
+    // 拉起内核期间也计入启动宽限，避免状态轮询把"正在连接"误判为内核意外退出
+    _startedAt = DateTime.Now;
     await _reloadFunc();
     for (var i = 0; i < 20 && !CoreManager.Instance.IsRunning; i++)
     {
@@ -1832,9 +2195,9 @@ public sealed class KeeperService
     {
     return;
     }
-    if (CoreShouldRun(_config.SystemProxyItem.SysProxyType))
+    if (CoreShouldRun(_config.SystemProxyItem.SysProxyType, _config.LocalProxyAlwaysOn, _proxySuspended))
     {
-    if (startIfNeeded)
+    if (startIfNeeded && !_proxySuspended)
     {
     if (await EnsureCoreRunningAsync())
     {
@@ -1867,19 +2230,21 @@ public sealed class KeeperService
     // 退出前收尾：停掉测速引擎和后台定时器，之后本应用不再有任何子进程
     public void Shutdown()
     {
-    try
-    {
-    _timer?.Dispose();
-    _timer = null;
-    _statusTimer?.Dispose();
-    _statusTimer = null;
-    _wsCts?.Cancel();
-    KillProc(Interlocked.Exchange(ref _testProc, null));
-    }
-    catch (Exception ex)
-    {
-    Logging.SaveLog("KeeperService shutdown", ex);
-    }
+        try
+        {
+            _shutDown = true;
+            _timer?.Dispose();
+            _timer = null;
+            _statusTimer?.Dispose();
+            _statusTimer = null;
+            _wsCts?.Cancel();
+            _refreshCts?.Cancel(); // 取消在途换血（抓取 / 测速等待），不让它退出后还在写状态、重载内核
+            KillProc(Interlocked.Exchange(ref _testProc, null));
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("KeeperService shutdown", ex);
+        }
     }
 
 
@@ -1895,7 +2260,7 @@ public sealed class KeeperService
         {
             State.PinnedIndexId = State.PinnedRemarks = string.Empty;
             await ConfigHandler.SetDefaultServerIndex(_config, GroupIndexId);
-            _ = _reloadFunc?.Invoke();
+            await ReloadCoreAsync("auto switch enabled");
         }
         else
         {
@@ -2808,8 +3173,8 @@ public sealed class KeeperService
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-            var addresses = await Dns.GetHostAddressesAsync(host, timeout.Token);
-            if (addresses.Length == 0 || addresses.Any(address => !IsPublicAddress(address))) { return -1; }
+            var addresses = OnlyPublicAddresses(await Dns.GetHostAddressesAsync(host, timeout.Token));
+            if (addresses.Length == 0) { return -1; }
             using var tcp = new TcpClient();
             // 可取消的连接：超时由同一个 token 触发，任务被正常等待并结束，
             // 不会留下"连接进行中就被释放"的孤儿任务（那种任务会在 GC 时以 SocketException 报成 ERROR）
@@ -2864,15 +3229,21 @@ public sealed class KeeperService
         State.QualityLinks ??= [];
         _minSecurityRank = Math.Max(1, SecurityRank(State.MinSecurity));
 
-        // 版本新增的节点来源合并进已保存配置：keeper.json 里的旧来源清单不知道新源
-        foreach (var url in new KeeperState().Pools)
+        // 只在首次运行（没有初始化标记）且来源为空时写入内置默认源。
+        // 用户已经保存过来源（哪怕删到只剩 1 条）就尊重现状，不再合并内置列表。
+        if (ShouldSeedDefaultPools(State.PoolsInitialized, State.Pools.Count))
         {
-            if (!State.Pools.Contains(url))
-            {
-                State.Pools.Add(url);
-            }
+            State.Pools.AddRange(new KeeperState().Pools);
+        }
+        if (!State.PoolsInitialized)
+        {
+            State.PoolsInitialized = true;
+            SaveState(); // 落盘标记，避免每次启动都做一次迁移判断
         }
     }
+
+    public static bool ShouldSeedDefaultPools(bool initialized, int savedPoolCount)
+        => !initialized && savedPoolCount == 0;
 
     // 主文件读不出来时，用上一次保存前的快照（keeper.json.bak）顶上，历史不丢
     private void TryLoadStateBackup(string path)
@@ -2945,6 +3316,9 @@ public class KeeperState
     public bool AutoSwitch { get; set; } = true;
     public bool DailyRefresh { get; set; } = true;
 
+    // 兼容旧状态：标记节点来源已完成初始化。之后用户删掉的源不再被内置列表自动加回。
+    public bool PoolsInitialized { get; set; }
+
 
     public List<string> Pools { get; set; } =
     [
@@ -2978,6 +3352,7 @@ public class KeeperState
     public int TopupIntervalHours { get; set; } = 4;      // 池健康盘点间隔（降级检查+缺员补位）
     public int RefreshIntervalHours { get; set; } = 12;   // 定时增量换血周期（12h，不盲目替换）
     public List<string> QualityLinks { get; set; } = []; // 最近一轮真测速达标链接库（补位来源）
+    public List<string> LastGoodLinks { get; set; } = []; // 最近一次成功换血的入池集合（last-known-good：池子不足时回滚补位）
 
     // ---- 节点安全审查 ----
     public string MinSecurity { get; set; } = "中"; // 注入门槛：中 = 放行「中」「高」；高 = 只放行「高」；「低」无论如何都拦截
@@ -3006,6 +3381,8 @@ public class KeeperState
     public List<KeeperNode> Nodes { get; set; } = [];
 
     public bool Online { get; set; }
+    // 节点全死回退后的代理挂起态（持久化）：重启后仍不自动拉起 TUN 内核，直到换血确认有可用节点
+    public bool ProxySuspended { get; set; }
     public string ExitNode { get; set; } = string.Empty;
     public string ExitIp { get; set; } = string.Empty;
     public string ExitCountry { get; set; } = string.Empty;

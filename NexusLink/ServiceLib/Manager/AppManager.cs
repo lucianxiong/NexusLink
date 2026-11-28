@@ -21,12 +21,20 @@ public sealed class AppManager
         }
     }
 
+    // 控制端口在整个进程生命周期内必须稳定。之前 TUN 偏移每次读取时现算，
+    // 生成内核配置与 Keeper 读取时 TUN 状态一旦不同，就会出现 10813/10814 漂移，
+    // 导致节点切换时报 127.0.0.1:xxxx 连接被拒。
+    public static int ResolveControllerPort(int defaultPort, bool enableTun)
+        => defaultPort + (enableTun ? 1 : 0);
+
     public int StatePort2
     {
         get
         {
-            _statePort2 ??= Utils.GetFreePort(GetLocalPort(EInboundProtocol.api2));
-            return _statePort2.Value + (_config.TunModeItem.EnableTun ? 1 : 0);
+            _statePort2 ??= ResolveControllerPort(
+                Utils.GetFreePort(GetLocalPort(EInboundProtocol.api2)),
+                _config.TunModeItem.EnableTun);
+            return _statePort2.Value;
         }
     }
 
@@ -123,7 +131,11 @@ public sealed class AppManager
 
             Logging.SaveLog("AppExitAsync End");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            // 退出阶段失败不能静默：至少留日志，否则"设置没保存上"无从排查
+            Logging.SaveLog("AppExitAsync", ex);
+        }
         finally
         {
             if (needShutdown)

@@ -94,33 +94,33 @@ public class Utils
     /// <returns></returns>
     public static string Base64Decode(string? plainText)
     {
-        try
+        if (plainText.IsNullOrEmpty())
         {
-            if (plainText.IsNullOrEmpty())
-            {
-                return string.Empty;
-            }
-
-            plainText = plainText.Trim()
-                .ReplaceLineBreaks("")
-                .Replace('_', '/')
-                .Replace('-', '+')
-                .Replace(" ", "");
-
-            if (plainText.Length % 4 > 0)
-            {
-                plainText = plainText.PadRight(plainText.Length + 4 - (plainText.Length % 4), '=');
-            }
-
-            var data = Convert.FromBase64String(plainText);
-            return Encoding.UTF8.GetString(data);
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
+            return string.Empty;
         }
 
-        return string.Empty;
+        var text = plainText.Trim()
+            .ReplaceLineBreaks("")
+            .Replace('_', '/')
+            .Replace('-', '+')
+            .Replace(" ", "");
+
+        // 明文链接 / JSON 直接返回，不当成 Base64 解码
+        if (text.Contains("://") || text.StartsWith('{'))
+        {
+            return plainText;
+        }
+
+        if (text.Length % 4 > 0)
+        {
+            text = text.PadRight(text.Length + 4 - (text.Length % 4), '=');
+        }
+
+        // 订阅里坏行很多，解码失败不再写整段异常堆栈（曾经一天写 800+ 次，日志膨胀且 UI 卡顿）
+        var buffer = new byte[text.Length];
+        return Convert.TryFromBase64String(text, buffer, out var written)
+            ? Encoding.UTF8.GetString(buffer, 0, written)
+            : string.Empty;
     }
 
 

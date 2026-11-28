@@ -198,6 +198,119 @@ public class KeeperPolicyTests
         await KeeperService.CoreShouldRun(ESysProxyType.ForcedChange).Should().BeTrue();
         await KeeperService.CoreShouldRun(ESysProxyType.ForcedClear).Should().BeFalse();
         await KeeperService.CoreShouldRun(ESysProxyType.Unchanged).Should().BeFalse();
+        // 本地代理常驻模式：系统代理关闭也要保持内核运行
+        await KeeperService.CoreShouldRun(ESysProxyType.ForcedClear, true).Should().BeTrue();
+        await KeeperService.CoreShouldRun(ESysProxyType.ForcedClear, false).Should().BeFalse();
+    }
+
+    // ---- 内置节点源只在首次运行时写入；用户删过的源不再自动加回 ----
+    [Test]
+    public async Task BuiltinPoolsSeedOnlyOnFirstRun()
+    {
+        await KeeperService.ShouldSeedDefaultPools(false, 0).Should().BeTrue();
+        await KeeperService.ShouldSeedDefaultPools(false, 2).Should().BeFalse();
+        await KeeperService.ShouldSeedDefaultPools(true, 0).Should().BeFalse();
+        await KeeperService.ShouldSeedDefaultPools(true, 13).Should().BeFalse();
+    }
+
+    // ---- 节点池成员变化：在用节点还在就不重载内核，避免打断长连接 ----
+    [Test]
+    public async Task PoolChangeReloadsOnlyWhenActiveNodeGone()
+    {
+        var items = new[]
+        {
+            new ServiceLib.Models.Entities.ProfileItem { IndexId = "a" },
+            new ServiceLib.Models.Entities.ProfileItem { IndexId = "b" },
+        };
+        await KeeperService.ShouldReloadCoreForPoolChange("a", items).Should().BeFalse();
+        await KeeperService.ShouldReloadCoreForPoolChange("b", items).Should().BeFalse();
+        await KeeperService.ShouldReloadCoreForPoolChange("gone", items).Should().BeTrue();
+        await KeeperService.ShouldReloadCoreForPoolChange("", items).Should().BeTrue();
+    }
+
+    // ---- 节点全死（探测全失败）且连续两轮换血无解才回退直连；只是慢或短暂抖动不回退 ----
+    [Test]
+    public async Task AllDeadFallsBackToDirectAfterTwoFailedRounds()
+    {
+        await KeeperService.ShouldFallbackAllDead(false, 1).Should().BeFalse();
+        await KeeperService.ShouldFallbackAllDead(false, 2).Should().BeTrue();
+        await KeeperService.ShouldFallbackAllDead(true, 5).Should().BeFalse();
+    }
+
+    // ---- 驱逐下限：剔完至少留 MinAlive 条；池子本来就不足时一条都不剔 ----
+    [Test]
+    public async Task EvictionBudgetKeepsMinAlive()
+    {
+        await KeeperService.EvictionBudget(12, 3).Should().BeEqualTo(9);
+        await KeeperService.EvictionBudget(3, 3).Should().BeEqualTo(0);
+        await KeeperService.EvictionBudget(2, 3).Should().BeEqualTo(0);
+        await KeeperService.EvictionBudget(10, 0).Should().BeEqualTo(10);
+    }
+
+    // ---- 刷新失败指数退避：15 分钟起翻倍，封顶为换血周期，最长不超过 24 小时 ----
+    [Test]
+    public async Task RefreshRetryBacksOff()
+    {
+        var interval = TimeSpan.FromHours(12);
+        await KeeperService.RefreshRetryDelay(1, interval).Should().BeEqualTo(TimeSpan.FromMinutes(15));
+        await KeeperService.RefreshRetryDelay(3, interval).Should().BeEqualTo(TimeSpan.FromMinutes(60));
+        await KeeperService.RefreshRetryDelay(10, interval).Should().BeEqualTo(interval);
+        await KeeperService.RefreshRetryDelay(1, TimeSpan.FromMinutes(1)).Should().BeEqualTo(TimeSpan.FromMinutes(15));
+        await KeeperService.RefreshRetryDelay(20, TimeSpan.FromHours(100)).Should().BeEqualTo(TimeSpan.FromHours(24));
+    }
+
+    // ---- DNS 过滤：只留公网地址；全是内网地址返回空 ----
+    [Test]
+    public async Task DnsKeepsPublicAddressesOnly()
+    {
+        var kept = KeeperService.OnlyPublicAddresses([IPAddress.Parse("8.8.8.8"), IPAddress.Parse("192.168.1.1")]);
+        await kept.Length.Should().BeEqualTo(1);
+        await kept[0].Should().BeEqualTo(IPAddress.Parse("8.8.8.8"));
+        await KeeperService.OnlyPublicAddresses([IPAddress.Parse("10.0.0.1")]).Length.Should().BeEqualTo(0);
+    }
+
+    // ---- 连接被拒 / 超时属瞬态，不打堆栈；其它异常照常记录 ----
+    [Test]
+    public async Task TransientConnectErrorsAreQuiet()
+    {
+        var refused = new HttpRequestException("refused", new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.ConnectionRefused));
+        await KeeperService.IsTransientConnectError(refused).Should().BeTrue();
+        await KeeperService.IsTransientConnectError(new InvalidOperationException("x")).Should().BeFalse();
+    }
+
+    // ---- 内核在连接状态下意外退出才回退直连；启动宽限期内不误判 ----
+    [Test]
+    public async Task FallbackToDirectOnlyWhenCoreDiesWhileConnected()
+    {
+        static bool Fallback(ESysProxyType type, bool running, double seconds, double grace)
+            => KeeperService.ShouldFallbackToDirect(type, running, seconds, grace);
+
+        await Fallback(ESysProxyType.ForcedChange, false, 40, 30).Should().BeTrue();
+        await Fallback(ESysProxyType.ForcedChange, true, 40, 30).Should().BeFalse();
+        await Fallback(ESysProxyType.ForcedChange, false, 10, 30).Should().BeFalse();
+        await Fallback(ESysProxyType.ForcedClear, false, 40, 30).Should().BeFalse();
+        await Fallback(ESysProxyType.Unchanged, false, 40, 30).Should().BeFalse();
+    }
+
+    // ---- 控制端口只在首次解析时算一次，TUN 状态变化不得让 Keeper 与内核配置读到不同端口 ----
+    [Test]
+    public async Task ControllerPortOffsetIsResolvedOnce()
+    {
+        await ServiceLib.Manager.AppManager.ResolveControllerPort(10813, false).Should().BeEqualTo(10813);
+        await ServiceLib.Manager.AppManager.ResolveControllerPort(10813, true).Should().BeEqualTo(10814);
+    }
+
+    // ---- 节点全死挂起态：一律不拉内核，避免 TUN 重建让整机断网；解除后才按连接/常驻恢复 ----
+    [Test]
+    public async Task ProxySuspendedNeverStartsCore()
+    {
+        // 挂起态：无论连接还是常驻，都不拉内核
+        await KeeperService.CoreShouldRun(ESysProxyType.ForcedChange, true, true).Should().BeFalse();
+        await KeeperService.CoreShouldRun(ESysProxyType.ForcedClear, true, true).Should().BeFalse();
+        // 解除挂起：连接态 / 常驻态恢复拉内核，纯断开态不拉
+        await KeeperService.CoreShouldRun(ESysProxyType.ForcedChange, false, false).Should().BeTrue();
+        await KeeperService.CoreShouldRun(ESysProxyType.ForcedClear, true, false).Should().BeTrue();
+        await KeeperService.CoreShouldRun(ESysProxyType.ForcedClear, false, false).Should().BeFalse();
     }
 
     // ---- TUN 只是连接方式：开关仍是「连接」；开启需要管理员权限 ----

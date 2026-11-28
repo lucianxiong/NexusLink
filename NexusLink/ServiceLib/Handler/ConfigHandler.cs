@@ -213,13 +213,18 @@ public static class ConfigHandler
     /// </summary>
     /// <param name="config">Configuration object to be saved</param>
     /// <returns>0 if successful, -1 if failed</returns>
+    private static readonly SemaphoreSlim _configSaveLock = new(1, 1);
+
     public static async Task<int> SaveConfig(Config config)
     {
+        // 定时保存 / 退出保存 / 状态轮询保存可能同时进来：串行化 + 每次独立的临时文件，避免互相覆盖出截断的 JSON
+        await _configSaveLock.WaitAsync();
+        var tempPath = string.Empty;
         try
         {
             //save temp file
             var resPath = Utils.GetConfigPath(_configRes);
-            var tempPath = $"{resPath}_temp";
+            tempPath = $"{resPath}.{Utils.GetGuid(false)}.tmp";
 
             var content = JsonUtils.Serialize(config, true, true);
             if (content.IsNullOrEmpty())
@@ -227,6 +232,11 @@ public static class ConfigHandler
                 return -1;
             }
             await File.WriteAllTextAsync(tempPath, content);
+            if (JsonUtils.Deserialize<Config>(await File.ReadAllTextAsync(tempPath)) == null)
+            {
+                Logging.SaveLog($"{_tag} save config: refusing to replace config with unparsable content");
+                return -1;
+            }
 
             //rename
             File.Move(tempPath, resPath, true);
@@ -235,6 +245,14 @@ public static class ConfigHandler
         {
             Logging.SaveLog(_tag, ex);
             return -1;
+        }
+        finally
+        {
+            if (tempPath.IsNotEmpty())
+            {
+                try { File.Delete(tempPath); } catch { }
+            }
+            _configSaveLock.Release();
         }
 
         return 0;
@@ -1574,6 +1592,25 @@ public static class ConfigHandler
         if (counter < 1)
         {
             counter = await AddBatchServers4Custom(config, strData, subid, isSub);
+        }
+
+        // 订阅刷新"先删后解析"的兜底：源返回错误页 / 格式变了 / 网络抖动导致一条都没解析出来时，
+        // 把删掉的旧节点原样放回去，不让一次失败把订阅清空（自定义配置文件已删的无法恢复，会记日志）
+        if (counter < 1 && isSub && subid.IsNotEmpty() && lstOriSub is { Count: > 0 })
+        {
+            var restorable = lstOriSub.Where(t => t.ConfigType != EConfigType.Custom && t.ConfigType != EConfigType.Outbound).ToList();
+            foreach (var item in restorable)
+            {
+                try
+                {
+                    await SQLiteHelper.Instance.InsertAsync(item);
+                }
+                catch (Exception ex)
+                {
+                    Logging.SaveLog(_tag, ex);
+                }
+            }
+            Logging.SaveLog($"subscription update for '{subid}' parsed 0 nodes; restored {restorable.Count}/{lstOriSub.Count} previous nodes");
         }
 
         //Select active node
